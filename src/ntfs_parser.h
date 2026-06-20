@@ -50,14 +50,15 @@ public:
     };
     bool parse_usn_journal(std::vector<UsnJournalEntry>& entries);
 
+    // Public static helpers for utility and testability
+    static std::string utf16le_to_utf8(const uint16_t* utf16, size_t len);
+    static bool unpack_runs(const uint8_t* run_buf, size_t run_buf_size, std::vector<DataRun>& runs);
+
 private:
     // Raw disk reading helpers
     bool read_disk(uint64_t offset, void* buffer, size_t size);
     bool read_from_runs(const std::vector<DataRun>& runs, uint64_t offset, void* buffer, size_t size);
     bool read_mft_record(uint64_t record_idx, std::vector<uint8_t>& buf);
-
-    // Run-list parsing helper
-    bool unpack_runs(const uint8_t* run_buf, size_t run_buf_size, std::vector<DataRun>& runs);
     
     // Fixup verification helper
     bool apply_fixups(uint8_t* buffer, size_t size, uint16_t fix_off, uint16_t fix_num);

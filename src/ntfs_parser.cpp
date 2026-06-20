@@ -8,8 +8,31 @@
 
 namespace {
 
+// Get priority for name namespace: higher is better
+int get_namespace_priority(uint8_t ns) {
+    if (ns == 3) return 3; // Unicode & DOS
+    if (ns == 1) return 2; // Unicode
+    if (ns == 0) return 1; // POSIX
+    if (ns == 2) return 0; // DOS (last choice)
+    return -1;
+}
+
+// Formatting size in human readable format
+std::string format_size(uint64_t bytes) {
+    constexpr uint64_t KB = 1024;
+    constexpr uint64_t MB = KB * 1024;
+    constexpr uint64_t GB = MB * 1024;
+
+    if (bytes >= GB) return fmt::format("{:.2f} GB", static_cast<double>(bytes) / GB);
+    if (bytes >= MB) return fmt::format("{:.2f} MB", static_cast<double>(bytes) / MB);
+    if (bytes >= KB) return fmt::format("{:.2f} KB", static_cast<double>(bytes) / KB);
+    return fmt::format("{} Bytes", bytes);
+}
+
+} // namespace
+
 // Helper to convert UTF-16LE to UTF-8
-std::string utf16le_to_utf8(const uint16_t* utf16, size_t len) {
+std::string NtfsParser::utf16le_to_utf8(const uint16_t* utf16, size_t len) {
     std::string utf8;
     utf8.reserve(len);
     for (size_t i = 0; i < len; ++i) {
@@ -41,29 +64,6 @@ std::string utf16le_to_utf8(const uint16_t* utf16, size_t len) {
     }
     return utf8;
 }
-
-// Get priority for name namespace: higher is better
-int get_namespace_priority(uint8_t ns) {
-    if (ns == 3) return 3; // Unicode & DOS
-    if (ns == 1) return 2; // Unicode
-    if (ns == 0) return 1; // POSIX
-    if (ns == 2) return 0; // DOS (last choice)
-    return -1;
-}
-
-// Formatting size in human readable format
-std::string format_size(uint64_t bytes) {
-    constexpr uint64_t KB = 1024;
-    constexpr uint64_t MB = KB * 1024;
-    constexpr uint64_t GB = MB * 1024;
-
-    if (bytes >= GB) return fmt::format("{:.2f} GB", static_cast<double>(bytes) / GB);
-    if (bytes >= MB) return fmt::format("{:.2f} MB", static_cast<double>(bytes) / MB);
-    if (bytes >= KB) return fmt::format("{:.2f} KB", static_cast<double>(bytes) / KB);
-    return fmt::format("{} Bytes", bytes);
-}
-
-} // namespace
 
 NtfsParser::NtfsParser() {}
 
