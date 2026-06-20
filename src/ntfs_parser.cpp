@@ -585,51 +585,163 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries) {
         return false;
     }
 
-    // 3. Locate the $J Data Stream attribute
+    // 3. Locate the $J Data Stream attribute or $ATTRIBUTE_LIST
     const ATTRIB* j_attrib = nullptr;
+    const ATTRIB* al_attrib = nullptr;
     uint32_t attr_offset = rec->attr_off;
     while (attr_offset + 24 <= rec->used) {
         const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(rec_buf.data() + attr_offset);
         if (attrib->type == ATTR_END) break;
         if (attr_offset + attrib->size > rec->used) break;
 
-        if (attrib->type == ATTR_DATA) {
-            // Check name of stream
-            if (attrib->name_len > 0) {
-                const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
-                    reinterpret_cast<const uint8_t*>(attrib) + attrib->name_off
-                );
-                // Check if name is "$J" (2 characters)
-                if (attrib->name_len == 2 && name_ptr[0] == 0x0024 && name_ptr[1] == 0x004A) {
-                    j_attrib = attrib;
-                    break;
-                }
-            }
+        std::string name = "";
+        if (attrib->name_len > 0) {
+            const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
+                reinterpret_cast<const uint8_t*>(attrib) + attrib->name_off
+            );
+            name = utf16le_to_utf8(name_ptr, attrib->name_len);
         }
+
+        if (attrib->type == ATTR_DATA && name == "$J") {
+            j_attrib = attrib;
+        } else if (attrib->type == ATTR_LIST) {
+            al_attrib = attrib;
+        }
+
         attr_offset += attrib->size;
         if (attrib->size == 0) break;
     }
 
-    if (!j_attrib) {
-        std::cerr << "Error: $J stream attribute not found in $UsnJrnl.\n";
-        return false;
-    }
-
-    if (!j_attrib->non_res) {
-        std::cerr << "Error: $J stream attribute is resident (unexpected for change journal).\n";
-        return false;
-    }
-
-    // 4. Unpack $J runs
     std::vector<DataRun> j_runs;
-    const uint8_t* run_buf = reinterpret_cast<const uint8_t*>(j_attrib) + j_attrib->nres.run_off;
-    size_t run_buf_size = j_attrib->size - j_attrib->nres.run_off;
-    if (!unpack_runs(run_buf, run_buf_size, j_runs)) {
-        std::cerr << "Error: Failed to unpack runs for $J stream.\n";
-        return false;
+    uint64_t j_stream_size = 0;
+    bool found_j_stream = false;
+
+    if (j_attrib) {
+        if (j_attrib->non_res) {
+            const uint8_t* run_buf = reinterpret_cast<const uint8_t*>(j_attrib) + j_attrib->nres.run_off;
+            size_t run_buf_size = j_attrib->size - j_attrib->nres.run_off;
+            if (unpack_runs(run_buf, run_buf_size, j_runs)) {
+                j_stream_size = j_attrib->nres.data_size;
+                found_j_stream = true;
+            }
+        } else {
+            std::cerr << "Error: $J stream attribute in base record is resident (unexpected for change journal).\n";
+            return false;
+        }
+    } else if (al_attrib) {
+        // Read the attribute list content
+        std::vector<uint8_t> attr_list_buf;
+        if (!al_attrib->non_res) {
+            // Resident attribute list
+            if (al_attrib->res.data_off + al_attrib->res.data_size <= al_attrib->size) {
+                const uint8_t* data_ptr = reinterpret_cast<const uint8_t*>(al_attrib) + al_attrib->res.data_off;
+                attr_list_buf.assign(data_ptr, data_ptr + al_attrib->res.data_size);
+            }
+        } else {
+            // Non-resident attribute list
+            std::vector<DataRun> al_runs;
+            const uint8_t* run_buf = reinterpret_cast<const uint8_t*>(al_attrib) + al_attrib->nres.run_off;
+            size_t run_buf_size = al_attrib->size - al_attrib->nres.run_off;
+            if (unpack_runs(run_buf, run_buf_size, al_runs)) {
+                attr_list_buf.resize(al_attrib->nres.data_size);
+                if (!read_from_runs(al_runs, 0, attr_list_buf.data(), attr_list_buf.size())) {
+                    std::cerr << "Error: Failed to read non-resident attribute list.\n";
+                    return false;
+                }
+            }
+        }
+
+        if (!attr_list_buf.empty()) {
+#pragma pack(push, 1)
+            struct ATTR_LIST_ENTRY {
+                uint32_t type;
+                uint16_t record_length;
+                uint8_t  name_length;
+                uint8_t  name_offset;
+                uint64_t lowest_vcn;
+                uint64_t mft_reference;
+                uint16_t attribute_id;
+                uint16_t name[1];
+            };
+#pragma pack(pop)
+
+            size_t al_offset = 0;
+            while (al_offset + 0x1A <= attr_list_buf.size()) {
+                const ATTR_LIST_ENTRY* entry = reinterpret_cast<const ATTR_LIST_ENTRY*>(attr_list_buf.data() + al_offset);
+                if (entry->record_length == 0) break;
+                if (al_offset + entry->record_length > attr_list_buf.size()) break;
+
+                if (entry->type == ATTR_DATA) {
+                    std::string entry_name = "";
+                    if (entry->name_length > 0 && entry->name_offset + entry->name_length * 2 <= entry->record_length) {
+                        const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
+                            reinterpret_cast<const uint8_t*>(entry) + entry->name_offset
+                        );
+                        entry_name = utf16le_to_utf8(name_ptr, entry->name_length);
+                    }
+
+                    if (entry_name == "$J") {
+                        uint64_t ext_mft_idx = entry->mft_reference & 0x0000FFFFFFFFFFFFULL;
+                        std::vector<uint8_t> ext_rec_buf;
+                        if (read_mft_record(ext_mft_idx, ext_rec_buf)) {
+                            MFT_REC* ext_rec = reinterpret_cast<MFT_REC*>(ext_rec_buf.data());
+                            if (apply_fixups(ext_rec_buf.data(), record_size_, ext_rec->rhdr.fix_off, ext_rec->rhdr.fix_num)) {
+                                uint32_t ext_attr_offset = ext_rec->attr_off;
+                                while (ext_attr_offset + 24 <= ext_rec->used) {
+                                    const ATTRIB* ext_attrib = reinterpret_cast<const ATTRIB*>(ext_rec_buf.data() + ext_attr_offset);
+                                    if (ext_attrib->type == ATTR_END) break;
+                                    if (ext_attr_offset + ext_attrib->size > ext_rec->used) break;
+
+                                    if (ext_attrib->type == ATTR_DATA) {
+                                        std::string ext_name = "";
+                                        if (ext_attrib->name_len > 0) {
+                                            const uint16_t* ext_name_ptr = reinterpret_cast<const uint16_t*>(
+                                                reinterpret_cast<const uint8_t*>(ext_attrib) + ext_attrib->name_off
+                                            );
+                                            ext_name = utf16le_to_utf8(ext_name_ptr, ext_attrib->name_len);
+                                        }
+
+                                        if (ext_name == "$J" && ext_attrib->id == entry->attribute_id) {
+                                            if (ext_attrib->non_res) {
+                                                std::vector<DataRun> seg_runs;
+                                                const uint8_t* ext_run_buf = reinterpret_cast<const uint8_t*>(ext_attrib) + ext_attrib->nres.run_off;
+                                                size_t ext_run_buf_size = ext_attrib->size - ext_attrib->nres.run_off;
+                                                if (unpack_runs(ext_run_buf, ext_run_buf_size, seg_runs)) {
+                                                    uint64_t svcn = ext_attrib->nres.svcn;
+                                                    for (auto& run : seg_runs) {
+                                                        run.vcn += svcn;
+                                                        j_runs.push_back(run);
+                                                    }
+                                                    j_stream_size = std::max(j_stream_size, ext_attrib->nres.data_size);
+                                                    found_j_stream = true;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    ext_attr_offset += ext_attrib->size;
+                                    if (ext_attrib->size == 0) break;
+                                }
+                            }
+                        }
+                    }
+                }
+                al_offset += entry->record_length;
+            }
+
+            if (found_j_stream) {
+                // Sort runs by VCN
+                std::sort(j_runs.begin(), j_runs.end(), [](const DataRun& a, const DataRun& b) {
+                    return a.vcn < b.vcn;
+                });
+            }
+        }
     }
 
-    uint64_t j_stream_size = j_attrib->nres.data_size;
+    if (!found_j_stream) {
+        std::cerr << "Error: $J stream attribute not found in $UsnJrnl MFT base or extension records.\n";
+        return false;
+    }
 
     // 5. Find the start of active (non-sparse) data
     uint64_t active_offset = 0;
@@ -684,7 +796,7 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries) {
                 entry.timestamp = record->timestamp;
 
                 // Extract filename
-                if (record->name_offset + record->name_length <= record->record_length) {
+                if (static_cast<uint32_t>(record->name_offset) + record->name_length <= record->record_length) {
                     const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
                         reinterpret_cast<const uint8_t*>(record) + record->name_offset
                     );
