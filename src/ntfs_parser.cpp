@@ -382,107 +382,127 @@ bool NtfsParser::parse() {
     std::cout << fmt::format("[MFT Parse] MFT Records Count: {}\n", num_records);
 
     // 2. Loop through all MFT records
-    std::vector<uint8_t> rec_buf(record_size_);
     files_.reserve(num_records);
-
     for (uint64_t idx = 0; idx < num_records; ++idx) {
-        // Read record
-        if (!read_mft_record(idx, rec_buf)) {
-            continue; // Skip failed reads
-        }
-
-        MFT_REC* rec = reinterpret_cast<MFT_REC*>(rec_buf.data());
-
-        // Perform Fixups
-        if (!apply_fixups(rec_buf.data(), record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
-            continue; // Fixup failed, record corrupted, skip
-        }
-
-        // Validate record
-        if (rec->rhdr.sign != SIGN_FILE) {
-            continue; // Skip invalid signatures
-        }
-
-        // Only parse active base MFT records
-        if (!(rec->flags & RECORD_FLAG_IN_USE)) {
-            continue; // Skip unused/deleted records
-        }
-
-        if (rec->parent_ref.get_record_id() != 0) {
-            continue; // Skip non-base/extension records
-        }
-
-        // Gather details
-        uint64_t parent_id = 0;
-        std::string best_name;
-        int best_ns_priority = -1;
-        uint64_t file_size = 0;
-        bool size_from_data = false;
-        bool has_name = false;
-
-        // Iterate over attributes in record
-        uint32_t attr_offset = rec->attr_off;
-        while (attr_offset + 24 <= rec->used) {
-            const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(rec_buf.data() + attr_offset);
-            if (attrib->type == ATTR_END) {
-                break;
-            }
-
-            if (attr_offset + attrib->size > rec->used) {
-                break; // Attribute size goes beyond used record size
-            }
-
-            if (attrib->type == ATTR_NAME) {
-                // File Name Attribute
-                if (!attrib->non_res) {
-                    const ATTR_FILE_NAME* fname = reinterpret_cast<const ATTR_FILE_NAME*>(
-                        reinterpret_cast<const uint8_t*>(attrib) + attrib->res.data_off
-                    );
-                    
-                    // Verify size
-                    if (attrib->res.data_off + sizeof(ATTR_FILE_NAME) <= attrib->size) {
-                        int priority = get_namespace_priority(fname->type);
-                        if (priority > best_ns_priority) {
-                            best_ns_priority = priority;
-                            parent_id = fname->home.get_record_id();
-                            best_name = utf16le_to_utf8(fname->name, fname->name_len);
-                            has_name = true;
-                            // Fallback file size
-                            if (!size_from_data) {
-                                file_size = fname->dup.data_size;
-                            }
-                        }
-                    }
-                }
-            } else if (attrib->type == ATTR_DATA) {
-                // Data Attribute
-                // Default data stream usually has name_len == 0
-                if (attrib->name_len == 0) {
-                    if (attrib->non_res) {
-                        file_size = attrib->nres.data_size;
-                    } else {
-                        file_size = attrib->res.data_size;
-                    }
-                    size_from_data = true;
-                }
-            }
-
-            attr_offset += attrib->size;
-            if (attrib->size == 0) break;
-        }
-
-        if (has_name) {
-            FileEntry entry;
-            entry.id = idx;
-            entry.parent_id = parent_id;
-            entry.name = best_name;
-            entry.is_directory = (rec->flags & RECORD_FLAG_DIR);
-            entry.size = entry.is_directory ? 0 : file_size;
+        FileEntry entry;
+        if (parse_mft_record_to_entry(idx, entry)) {
             files_[idx] = entry;
         }
     }
 
     // 3. Resolve paths
+    resolve_all_paths();
+
+    // 4. Query and initialize last USN
+    last_usn_ = query_current_usn();
+    std::cout << fmt::format("[USN Init] Initialized last USN position to: 0x{:X}\n", last_usn_);
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    std::cout << fmt::format("[Scan Completed] Scanned {} files/dirs in {} ms\n", files_.size(), elapsed.count());
+
+    return true;
+}
+
+bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
+    std::vector<uint8_t> rec_buf;
+    if (!read_mft_record(idx, rec_buf)) {
+        return false;
+    }
+
+    MFT_REC* rec = reinterpret_cast<MFT_REC*>(rec_buf.data());
+
+    // Perform Fixups
+    if (!apply_fixups(rec_buf.data(), record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
+        return false;
+    }
+
+    // Validate record
+    if (rec->rhdr.sign != SIGN_FILE) {
+        return false;
+    }
+
+    // Only parse active base MFT records
+    if (!(rec->flags & RECORD_FLAG_IN_USE)) {
+        return false;
+    }
+
+    if (rec->parent_ref.get_record_id() != 0) {
+        return false; // Skip non-base/extension records
+    }
+
+    // Gather details
+    uint64_t parent_id = 0;
+    std::string best_name;
+    int best_ns_priority = -1;
+    uint64_t file_size = 0;
+    bool size_from_data = false;
+    bool has_name = false;
+
+    // Iterate over attributes in record
+    uint32_t attr_offset = rec->attr_off;
+    while (attr_offset + 24 <= rec->used) {
+        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(rec_buf.data() + attr_offset);
+        if (attrib->type == ATTR_END) {
+            break;
+        }
+
+        if (attr_offset + attrib->size > rec->used) {
+            break; // Attribute size goes beyond used record size
+        }
+
+        if (attrib->type == ATTR_NAME) {
+            // File Name Attribute
+            if (!attrib->non_res) {
+                const ATTR_FILE_NAME* fname = reinterpret_cast<const ATTR_FILE_NAME*>(
+                    reinterpret_cast<const uint8_t*>(attrib) + attrib->res.data_off
+                );
+                
+                // Verify size
+                if (attrib->res.data_off + sizeof(ATTR_FILE_NAME) <= attrib->size) {
+                    int priority = get_namespace_priority(fname->type);
+                    if (priority > best_ns_priority) {
+                        best_ns_priority = priority;
+                        parent_id = fname->home.get_record_id();
+                        best_name = utf16le_to_utf8(fname->name, fname->name_len);
+                        has_name = true;
+                        // Fallback file size
+                        if (!size_from_data) {
+                            file_size = fname->dup.data_size;
+                        }
+                    }
+                }
+            }
+        } else if (attrib->type == ATTR_DATA) {
+            // Data Attribute
+            // Default data stream usually has name_len == 0
+            if (attrib->name_len == 0) {
+                if (attrib->non_res) {
+                    file_size = attrib->nres.data_size;
+                } else {
+                    file_size = attrib->res.data_size;
+                }
+                size_from_data = true;
+            }
+        }
+
+        attr_offset += attrib->size;
+        if (attrib->size == 0) break;
+    }
+
+    if (has_name) {
+        entry.id = idx;
+        entry.parent_id = parent_id;
+        entry.name = best_name;
+        entry.is_directory = (rec->flags & RECORD_FLAG_DIR);
+        entry.size = entry.is_directory ? 0 : file_size;
+        return true;
+    }
+
+    return false;
+}
+
+void NtfsParser::resolve_all_paths() {
     // Root directory (record 5)
     files_[5].full_path = "/";
     files_[5].is_directory = true;
@@ -524,12 +544,6 @@ bool NtfsParser::parse() {
         }
         entry.full_path = path;
     }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    std::cout << fmt::format("[Scan Completed] Scanned {} files/dirs in {} ms\n", files_.size(), elapsed.count());
-
-    return true;
 }
 
 void NtfsParser::print_stats() const {
@@ -554,7 +568,7 @@ void NtfsParser::print_stats() const {
     std::cout << "======================================================\n\n";
 }
 
-bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries) {
+bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t start_usn, uint64_t* next_usn) {
     uint64_t usn_mft_idx = 0;
     bool found_usn_file = false;
 
@@ -757,6 +771,18 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries) {
 
     // 6. Read and parse USN records sequentially
     uint64_t curr_offset = active_offset;
+    if (start_usn > 0) {
+        if (start_usn < active_offset) {
+            std::cout << fmt::format("[USN Parse] start_usn 0x{:X} is older than active offset 0x{:X}. Journal was truncated.\n", start_usn, active_offset);
+            curr_offset = active_offset;
+        } else if (start_usn > j_stream_size) {
+            std::cout << fmt::format("[USN Parse] start_usn 0x{:X} is beyond stream size 0x{:X}.\n", start_usn, j_stream_size);
+            curr_offset = j_stream_size;
+        } else {
+            curr_offset = start_usn;
+        }
+    }
+
     std::vector<uint8_t> block_buf(256 * 1024); // Read in 256KB chunks
 
     while (curr_offset < j_stream_size) {
@@ -812,6 +838,233 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries) {
             curr_offset += aligned_len;
         }
     }
+
+    if (next_usn) {
+        *next_usn = curr_offset;
+    }
+
+    return true;
+}
+
+uint64_t NtfsParser::query_current_usn() {
+    uint64_t usn_mft_idx = 0;
+    bool found_usn_file = false;
+    for (const auto& [id, entry] : files_) {
+        if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
+            usn_mft_idx = id;
+            found_usn_file = true;
+            break;
+        }
+    }
+    if (!found_usn_file) return 0;
+
+    std::vector<uint8_t> rec_buf;
+    if (!read_mft_record(usn_mft_idx, rec_buf)) return 0;
+    MFT_REC* rec = reinterpret_cast<MFT_REC*>(rec_buf.data());
+    if (!apply_fixups(rec_buf.data(), record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) return 0;
+
+    const ATTRIB* j_attrib = nullptr;
+    const ATTRIB* al_attrib = nullptr;
+    uint32_t attr_offset = rec->attr_off;
+    while (attr_offset + 24 <= rec->used) {
+        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(rec_buf.data() + attr_offset);
+        if (attrib->type == ATTR_END) break;
+        if (attr_offset + attrib->size > rec->used) break;
+
+        std::string name = "";
+        if (attrib->name_len > 0) {
+            const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
+                reinterpret_cast<const uint8_t*>(attrib) + attrib->name_off
+            );
+            name = utf16le_to_utf8(name_ptr, attrib->name_len);
+        }
+        if (attrib->type == ATTR_DATA && name == "$J") {
+            j_attrib = attrib;
+        } else if (attrib->type == ATTR_LIST) {
+            al_attrib = attrib;
+        }
+        attr_offset += attrib->size;
+        if (attrib->size == 0) break;
+    }
+
+    if (j_attrib) {
+        return j_attrib->nres.data_size;
+    } else if (al_attrib) {
+        std::vector<uint8_t> attr_list_buf;
+        if (!al_attrib->non_res) {
+            if (al_attrib->res.data_off + al_attrib->res.data_size <= al_attrib->size) {
+                const uint8_t* data_ptr = reinterpret_cast<const uint8_t*>(al_attrib) + al_attrib->res.data_off;
+                attr_list_buf.assign(data_ptr, data_ptr + al_attrib->res.data_size);
+            }
+        } else {
+            std::vector<DataRun> al_runs;
+            const uint8_t* run_buf = reinterpret_cast<const uint8_t*>(al_attrib) + al_attrib->nres.run_off;
+            size_t run_buf_size = al_attrib->size - al_attrib->nres.run_off;
+            if (unpack_runs(run_buf, run_buf_size, al_runs)) {
+                attr_list_buf.resize(al_attrib->nres.data_size);
+                read_from_runs(al_runs, 0, attr_list_buf.data(), attr_list_buf.size());
+            }
+        }
+
+        if (!attr_list_buf.empty()) {
+#pragma pack(push, 1)
+            struct ATTR_LIST_ENTRY {
+                uint32_t type;
+                uint16_t record_length;
+                uint8_t  name_length;
+                uint8_t  name_offset;
+                uint64_t lowest_vcn;
+                uint64_t mft_reference;
+                uint16_t attribute_id;
+                uint16_t name[1];
+            };
+#pragma pack(pop)
+
+            size_t al_offset = 0;
+            while (al_offset + 0x1A <= attr_list_buf.size()) {
+                const ATTR_LIST_ENTRY* entry = reinterpret_cast<const ATTR_LIST_ENTRY*>(attr_list_buf.data() + al_offset);
+                if (entry->record_length == 0) break;
+                if (al_offset + entry->record_length > attr_list_buf.size()) break;
+
+                if (entry->type == ATTR_DATA) {
+                    std::string entry_name = "";
+                    if (entry->name_length > 0 && entry->name_offset + entry->name_length * 2 <= entry->record_length) {
+                        const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
+                            reinterpret_cast<const uint8_t*>(entry) + entry->name_offset
+                        );
+                        entry_name = utf16le_to_utf8(name_ptr, entry->name_length);
+                    }
+                    if (entry_name == "$J") {
+                        uint64_t ext_mft_idx = entry->mft_reference & 0x0000FFFFFFFFFFFFULL;
+                        std::vector<uint8_t> ext_rec_buf;
+                        if (read_mft_record(ext_mft_idx, ext_rec_buf)) {
+                            MFT_REC* ext_rec = reinterpret_cast<MFT_REC*>(ext_rec_buf.data());
+                            if (apply_fixups(ext_rec_buf.data(), record_size_, ext_rec->rhdr.fix_off, ext_rec->rhdr.fix_num)) {
+                                uint32_t ext_attr_offset = ext_rec->attr_off;
+                                while (ext_attr_offset + 24 <= ext_rec->used) {
+                                    const ATTRIB* ext_attrib = reinterpret_cast<const ATTRIB*>(ext_rec_buf.data() + ext_attr_offset);
+                                    if (ext_attrib->type == ATTR_END) break;
+                                    if (ext_attr_offset + ext_attrib->size > ext_rec->used) break;
+
+                                    if (ext_attrib->type == ATTR_DATA) {
+                                        std::string ext_name = "";
+                                        if (ext_attrib->name_len > 0) {
+                                            const uint16_t* ext_name_ptr = reinterpret_cast<const uint16_t*>(
+                                                reinterpret_cast<const uint8_t*>(ext_attrib) + ext_attrib->name_off
+                                            );
+                                            ext_name = utf16le_to_utf8(ext_name_ptr, ext_attrib->name_len);
+                                        }
+                                        if (ext_name == "$J" && ext_attrib->id == entry->attribute_id) {
+                                            if (ext_attrib->non_res) {
+                                                return ext_attrib->nres.data_size;
+                                            }
+                                        }
+                                    }
+                                    ext_attr_offset += ext_attrib->size;
+                                    if (ext_attrib->size == 0) break;
+                                }
+                            }
+                        }
+                    }
+                }
+                al_offset += entry->record_length;
+            }
+        }
+    }
+    return 0;
+}
+
+bool NtfsParser::update_index_incremental() {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    std::vector<UsnJournalEntry> entries;
+    uint64_t next_usn = last_usn_;
+    if (!parse_usn_journal(entries, last_usn_, &next_usn)) {
+        return false;
+    }
+
+    if (entries.empty()) {
+        std::cout << "No new changes in USN Change Journal. Index is up to date.\n";
+        return true;
+    }
+
+    size_t added = 0;
+    size_t modified = 0;
+    size_t deleted = 0;
+    std::unordered_map<uint64_t, std::string> deleted_names;
+    std::unordered_map<uint64_t, std::string> updated_names;
+
+    for (const auto& entry : entries) {
+        if (entry.reason & 0x00000200) { // DELETE
+            auto it = files_.find(entry.file_id);
+            if (it != files_.end()) {
+                deleted_names[entry.file_id] = it->second.full_path;
+                files_.erase(it);
+                deleted++;
+            }
+            updated_names.erase(entry.file_id);
+        } else {
+            FileEntry file_entry;
+            bool exists_before = (files_.find(entry.file_id) != files_.end());
+            std::string old_path = exists_before ? files_[entry.file_id].full_path : "";
+
+            if (parse_mft_record_to_entry(entry.file_id, file_entry)) {
+                files_[entry.file_id] = file_entry;
+                if (exists_before) {
+                    modified++;
+                    updated_names[entry.file_id] = "Modified: " + old_path;
+                } else {
+                    added++;
+                    updated_names[entry.file_id] = "Added: " + file_entry.name;
+                }
+            } else {
+                auto it = files_.find(entry.file_id);
+                if (it != files_.end()) {
+                    deleted_names[entry.file_id] = it->second.full_path;
+                    files_.erase(it);
+                    deleted++;
+                }
+                updated_names.erase(entry.file_id);
+            }
+        }
+    }
+
+    resolve_all_paths();
+
+    std::cout << "\nIncremental Update Summary:\n";
+    std::cout << fmt::format("  - Files Added:    {}\n", added);
+    std::cout << fmt::format("  - Files Modified: {}\n", modified);
+    std::cout << fmt::format("  - Files Deleted:  {}\n", deleted);
+
+    std::cout << "\nDetail of changes (last 50):\n";
+    size_t print_count = 0;
+    for (const auto& [id, path] : deleted_names) {
+        if (print_count >= 50) break;
+        std::cout << fmt::format("  [DELETED]  {}\n", path);
+        print_count++;
+    }
+    for (const auto& [id, msg] : updated_names) {
+        if (print_count >= 50) break;
+        auto it = files_.find(id);
+        if (it != files_.end()) {
+            if (msg.rfind("Modified:", 0) == 0) {
+                if (msg != "Modified: " + it->second.full_path) {
+                    std::cout << fmt::format("  [RENAMED]   {} -> {}\n", msg.substr(10), it->second.full_path);
+                } else {
+                    std::cout << fmt::format("  [MODIFIED]  {}\n", it->second.full_path);
+                }
+            } else {
+                std::cout << fmt::format("  [ADDED]     {}\n", it->second.full_path);
+            }
+            print_count++;
+        }
+    }
+
+    last_usn_ = next_usn;
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    std::cout << fmt::format("\nIncremental update finished in {} ms. Current USN: 0x{:X}\n\n", 
+        elapsed.count(), last_usn_);
 
     return true;
 }

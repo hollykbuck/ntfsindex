@@ -48,7 +48,10 @@ public:
         uint32_t reason = 0;
         uint64_t timestamp = 0; // Win32 FILETIME
     };
-    bool parse_usn_journal(std::vector<UsnJournalEntry>& entries);
+    bool parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t start_usn = 0, uint64_t* next_usn = nullptr);
+    bool update_index_incremental();
+    uint64_t query_current_usn();
+    uint64_t get_last_usn() const { return last_usn_; }
 
     // Public static helpers for utility and testability
     static std::string utf16le_to_utf8(const uint16_t* utf16, size_t len);
@@ -75,4 +78,8 @@ private:
 
     std::vector<DataRun> mft_runs_;
     std::unordered_map<uint64_t, FileEntry> files_;
+    uint64_t last_usn_ = 0;
+
+    bool parse_mft_record_to_entry(uint64_t idx, FileEntry& entry);
+    void resolve_all_paths();
 };
