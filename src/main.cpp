@@ -1,13 +1,72 @@
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include <iostream>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <ctime>
+#include <fstream>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 #include "ntfs_parser.h"
+#include "ntfs_indexer.h"
+#include "http_server.h"
+#include "tui_client.h"
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/flags/usage.h"
+#include "absl/log/log.h"
+#include "absl/log/initialize.h"
+#include "absl/log/log_sink.h"
+#include "absl/log/log_sink_registry.h"
+#include "absl/log/globals.h"
+#include "absl/base/log_severity.h"
+#include <mutex>
+#include <cstdlib>
+#include <memory>
 
 namespace {
+
+class FileLogSink : public absl::LogSink {
+ public:
+  explicit FileLogSink(const std::string& filename) : file_(filename, std::ios::app) {}
+  ~FileLogSink() override {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (file_.is_open()) {
+          file_.close();
+      }
+  }
+
+  void Send(const absl::LogEntry& entry) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (file_.is_open()) {
+      file_ << entry.text_message_with_prefix_and_newline();
+      file_.flush();
+    }
+  }
+
+ private:
+  std::ofstream file_;
+  std::mutex mutex_;
+};
+
+class ScopedFileLogger {
+public:
+    explicit ScopedFileLogger(const std::string& filename) {
+        sink_ = std::make_unique<FileLogSink>(filename);
+        absl::AddLogSink(sink_.get());
+    }
+    ~ScopedFileLogger() {
+        if (sink_) {
+            absl::RemoveLogSink(sink_.get());
+        }
+    }
+private:
+    std::unique_ptr<FileLogSink> sink_;
+};
 
 std::string to_lowercase(const std::string& str) {
     std::string lower = str;
@@ -17,121 +76,181 @@ std::string to_lowercase(const std::string& str) {
     return lower;
 }
 
-void print_help(const char* prog_name) {
-    std::cout << fmt::format("Usage: {} <mft_file_or_partition_path>\n", prog_name);
-    std::cout << "Examples:\n";
-    std::cout << fmt::format("  {} $MFT              # Scan an exported raw $MFT binary file\n", prog_name);
-    std::cout << fmt::format("  {} \\\\.\\C:           # Scan Windows C: drive directly (requires Administrator privileges)\n", prog_name);
-    std::cout << fmt::format("  {} /dev/sdb1         # Scan a Linux physical NTFS partition (requires root)\n", prog_name);
-    std::cout << fmt::format("  {} test_ntfs.img     # Scan a backup/test NTFS image file\n", prog_name);
+std::string format_usn_reason(uint32_t reason) {
+    std::vector<std::string> parts;
+    if (reason & 0x00000100) parts.push_back("CREATE");
+    if (reason & 0x00000200) parts.push_back("DELETE");
+    if (reason & 0x00001000) parts.push_back("RENAME_OLD");
+    if (reason & 0x00002000) parts.push_back("RENAME_NEW");
+    if (reason & 0x00000001) parts.push_back("DATA_OVERWRITE");
+    if (reason & 0x00000002) parts.push_back("DATA_EXTEND");
+    if (reason & 0x00000004) parts.push_back("DATA_TRUNC");
+    if (reason & 0x00008000) parts.push_back("BASIC_INFO");
+    if (reason & 0x00000800) parts.push_back("SECURITY");
+    if (reason & 0x80000000) parts.push_back("CLOSE");
+    
+    if (parts.empty() && reason != 0) {
+        parts.push_back(fmt::format("0x{:X}", reason));
+    }
+    
+    std::string result;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) result += "|";
+        result += parts[i];
+    }
+    return result.empty() ? "NONE" : result;
+}
+
+std::string format_filetime(uint64_t filetime) {
+    if (filetime == 0) return "-";
+    // Convert 100-nanosecond intervals to seconds (Win32 Epoch to Unix Epoch)
+    uint64_t unix_time = (filetime / 10000000ULL) - 11644473600ULL;
+    std::time_t t = static_cast<std::time_t>(unix_time);
+    std::tm tm;
+    #ifdef _WIN32
+    gmtime_s(&tm, &t);
+    #else
+    gmtime_r(&t, &tm);
+    #endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm);
+    return std::string(buf);
+}
+
+struct AppConfig {
+    std::string device_path = "$MFT";
+    uint16_t port = 8080;
+    std::string address = "0.0.0.0";
+    std::string doc_root = "./web";
+};
+
+AppConfig load_config(const std::string& path) {
+    AppConfig config;
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        LOG(INFO) << "[Config] Configuration file not found or couldn't be opened: " << path << ". Using defaults.";
+        return config;
+    }
+    try {
+        nlohmann::json j;
+        f >> j;
+        if (j.contains("device_path") && j["device_path"].is_string()) {
+            config.device_path = j["device_path"].get<std::string>();
+        }
+        if (j.contains("port") && j["port"].is_number_integer()) {
+            config.port = j["port"].get<uint16_t>();
+        }
+        if (j.contains("address") && j["address"].is_string()) {
+            config.address = j["address"].get<std::string>();
+        }
+        if (j.contains("doc_root") && j["doc_root"].is_string()) {
+            config.doc_root = j["doc_root"].get<std::string>();
+        }
+        LOG(INFO) << "[Config] Loaded configuration from: " << path;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "[Config] Error parsing " << path << ": " << e.what() << ". Using defaults.";
+    }
+    return config;
 }
 
 } // namespace
 
+// Define Abseil command line flags
+ABSL_FLAG(std::string, device_path, "", "Path to raw MFT file or partition (e.g. \\\\.\\C: or $MFT)");
+ABSL_FLAG(uint16_t, port, 0, "Port for the HTTP API server (e.g. 8080)");
+ABSL_FLAG(std::string, address, "", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
+ABSL_FLAG(std::string, doc_root, "", "Document root directory serving frontend assets");
+ABSL_FLAG(std::string, config, "config.json", "Path to config.json file containing default options");
+ABSL_FLAG(bool, tui, false, "Start in interactive TUI mode instead of HTTP Server");
+
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        print_help(argv[0]);
-        return 1;
+    // Initialize Abseil Program Usage and Parse CommandLine
+    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using config.json, arguments, or flags.");
+    auto positional_args = absl::ParseCommandLine(argc, argv);
+
+    // Initialize Abseil Logging
+    absl::InitializeLog();
+
+    // Set up file logging if environment variable is set
+    std::unique_ptr<ScopedFileLogger> file_logger;
+    const char* log_file_env = std::getenv("NTFSINDEX_LOG_FILE");
+    if (log_file_env && log_file_env[0] != '\0') {
+        file_logger = std::make_unique<ScopedFileLogger>(log_file_env);
     }
 
-    std::string dev_path = argv[1];
-    if (dev_path == "-h" || dev_path == "--help") {
-        print_help(argv[0]);
-        return 0;
+    // Silence stderr logging in TUI mode to avoid terminal corruption
+    if (absl::GetFlag(FLAGS_tui)) {
+        absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
     }
 
-    std::cout << fmt::format("Initializing parser for device: {} ...\n", dev_path);
+    // 1. Load config file
+    std::string config_path = absl::GetFlag(FLAGS_config);
+    AppConfig config = load_config(config_path);
+
+    // 2. Override with legacy positional arguments if provided
+    // Usage: prog_name <device_path> [port] [doc_root]
+    if (positional_args.size() >= 2) {
+        config.device_path = positional_args[1];
+    }
+    if (positional_args.size() >= 3) {
+        try {
+            config.port = static_cast<uint16_t>(std::stoul(positional_args[2]));
+        } catch (...) {}
+    }
+    if (positional_args.size() >= 4) {
+        config.doc_root = positional_args[3];
+    }
+
+    // 3. Override with explicit Abseil flags if specified on CLI
+    if (!absl::GetFlag(FLAGS_device_path).empty()) {
+        config.device_path = absl::GetFlag(FLAGS_device_path);
+    }
+    if (absl::GetFlag(FLAGS_port) != 0) {
+        config.port = absl::GetFlag(FLAGS_port);
+    }
+    if (!absl::GetFlag(FLAGS_address).empty()) {
+        config.address = absl::GetFlag(FLAGS_address);
+    }
+    if (!absl::GetFlag(FLAGS_doc_root).empty()) {
+        config.doc_root = absl::GetFlag(FLAGS_doc_root);
+    }
+
+    LOG(INFO) << "---------------------------------------------";
+    LOG(INFO) << "[Server Config Options]";
+    LOG(INFO) << fmt::format("  - Device/MFT Path: {}", config.device_path);
+    LOG(INFO) << fmt::format("  - Listen Address:  {}", config.address);
+    LOG(INFO) << fmt::format("  - Listen Port:     {}", config.port);
+    LOG(INFO) << fmt::format("  - Frontend Root:   {}", config.doc_root);
+    LOG(INFO) << "---------------------------------------------";
+
+    LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
     NtfsParser parser;
-    if (!parser.init(dev_path)) {
+    if (!parser.init(config.device_path)) {
         return 1;
     }
 
-    std::cout << "Starting MFT table scan...\n";
+    LOG(INFO) << "Starting MFT metadata parse...";
     if (!parser.parse()) {
-        std::cerr << "Error: Parsing failed.\n";
+        LOG(ERROR) << "Error: MFT parsing failed.";
         return 1;
     }
 
-    parser.print_stats();
+    LOG(INFO) << "Building initial file index...";
+    NtfsIndexer indexer;
+    if (!indexer.build_initial_index(parser)) {
+        LOG(ERROR) << "Error: Index build failed.";
+        return 1;
+    }
 
-    const auto& files = parser.get_files();
+    indexer.print_stats(config.device_path);
 
-    std::cout << "======================================================\n";
-    std::cout << "Interactive Search Mode Enabled!\n";
-    std::cout << "  - Enter search query to find files (case-insensitive substring match)\n";
-    std::cout << "  - Type ':stats' to show scanning statistics\n";
-    std::cout << "  - Type ':exit' or ':q' to exit\n";
-    std::cout << "======================================================\n\n";
-
-    std::string query;
-    while (true) {
-        std::cout << "search> ";
-        if (!std::getline(std::cin, query)) {
-            break;
-        }
-
-        // Trim input
-        query.erase(0, query.find_first_not_of(" \t\r\n"));
-        query.erase(query.find_last_not_of(" \t\r\n") + 1);
-
-        if (query.empty()) {
-            continue;
-        }
-
-        if (query == ":exit" || query == ":q" || query == "exit" || query == "quit") {
-            std::cout << "Goodbye!\n";
-            break;
-        }
-
-        if (query == ":stats") {
-            parser.print_stats();
-            continue;
-        }
-
-        std::string query_lower = to_lowercase(query);
-        std::vector<const FileEntry*> matches;
-
-        auto search_start = std::chrono::high_resolution_clock::now();
-        
-        for (const auto& [id, entry] : files) {
-            std::string name_lower = to_lowercase(entry.name);
-            if (name_lower.find(query_lower) != std::string::npos) {
-                matches.push_back(&entry);
-            }
-        }
-
-        auto search_end = std::chrono::high_resolution_clock::now();
-        auto search_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(search_end - search_start);
-
-        // Sort matches alphabetically by path
-        std::sort(matches.begin(), matches.end(), [](const FileEntry* a, const FileEntry* b) {
-            return a->full_path < b->full_path;
-        });
-
-        // Print matches (limit to 50 results)
-        size_t display_count = std::min(matches.size(), size_t(50));
-        if (matches.empty()) {
-            std::cout << fmt::format("No matches found for '{}' (searched in {} us)\n\n", query, search_elapsed.count());
-        } else {
-            std::cout << fmt::format("Found {} matches (showing first {} matches) in {} us:\n", 
-                                     matches.size(), display_count, search_elapsed.count());
-            std::cout << fmt::format("{:<70} | {:<10} | {}\n", "Path", "Type", "Size");
-            std::cout << std::string(100, '-') << "\n";
-            
-            for (size_t i = 0; i < display_count; ++i) {
-                const auto* entry = matches[i];
-                std::string type_str = entry->is_directory ? "DIR" : "FILE";
-                std::string size_str = entry->is_directory ? "-" : fmt::format("{}", entry->size);
-                
-                // Truncate path if too long
-                std::string path_to_show = entry->full_path;
-                if (path_to_show.length() > 68) {
-                    path_to_show = "..." + path_to_show.substr(path_to_show.length() - 65);
-                }
-                
-                std::cout << fmt::format("{:<70} | {:<10} | {}\n", path_to_show, type_str, size_str);
-            }
-            std::cout << "\n";
+    if (absl::GetFlag(FLAGS_tui)) {
+        TuiClient tui(parser, indexer);
+        tui.run();
+    } else {
+        HttpServer server(parser, indexer, config.address, config.port, config.doc_root, config.device_path);
+        if (!server.run()) {
+            return 1;
         }
     }
 
