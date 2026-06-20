@@ -163,14 +163,31 @@ bool NtfsParser::read_disk(uint64_t offset, void* buffer, size_t size) {
     if (size == 0) return true;
     if (!stream_.is_open()) return false;
 
-    stream_.clear();
-    stream_.seekg(offset, std::ios::beg);
-    if (!stream_) {
-        return false;
-    }
+    uint64_t align = sector_size_;
+    if (align == 0) align = 512;
 
-    stream_.read(reinterpret_cast<char*>(buffer), size);
-    return !stream_.fail();
+    uint64_t aligned_start = (offset / align) * align;
+    uint64_t aligned_end = ((offset + size + align - 1) / align) * align;
+    size_t aligned_size = static_cast<size_t>(aligned_end - aligned_start);
+
+    if (offset == aligned_start && size == aligned_size) {
+        stream_.clear();
+        stream_.seekg(offset, std::ios::beg);
+        if (!stream_) return false;
+        stream_.read(reinterpret_cast<char*>(buffer), size);
+        return !stream_.fail();
+    } else {
+        std::vector<uint8_t> temp_buf(aligned_size);
+        stream_.clear();
+        stream_.seekg(aligned_start, std::ios::beg);
+        if (!stream_) return false;
+        stream_.read(reinterpret_cast<char*>(temp_buf.data()), aligned_size);
+        if (stream_.fail()) return false;
+
+        uint64_t internal_offset = offset - aligned_start;
+        std::memcpy(buffer, temp_buf.data() + internal_offset, size);
+        return true;
+    }
 }
 
 bool NtfsParser::unpack_runs(const uint8_t* run_buf, size_t run_buf_size, std::vector<DataRun>& runs) {
@@ -748,6 +765,11 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
                 std::sort(j_runs.begin(), j_runs.end(), [](const DataRun& a, const DataRun& b) {
                     return a.vcn < b.vcn;
                 });
+                std::cout << "[USN Debug] j_runs size: " << j_runs.size() << "\n";
+                if (!j_runs.empty()) {
+                    std::cout << fmt::format("  First Run: VCN {} to {}, LCN {}\n", j_runs.front().vcn, j_runs.front().vcn + j_runs.front().length, j_runs.front().lcn);
+                    std::cout << fmt::format("  Last Run: VCN {} to {}, LCN {}\n", j_runs.back().vcn, j_runs.back().vcn + j_runs.back().length, j_runs.back().lcn);
+                }
             }
         }
     }

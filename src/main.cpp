@@ -103,6 +103,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  - Enter search query to find files (case-insensitive substring match)\n";
     std::cout << "  - Type ':stats' to show scanning statistics\n";
     std::cout << "  - Type ':usn' to parse and view USN Change Journal ($UsnJrnl)\n";
+    std::cout << "  - Type ':update' to perform incremental index update\n";
     std::cout << "  - Type ':exit' or ':q' to exit\n";
     std::cout << "======================================================\n\n";
 
@@ -163,6 +164,11 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "\n";
             }
+            continue;
+        }
+
+        if (query == ":update") {
+            parser.update_index_incremental();
             continue;
         }
 

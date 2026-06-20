@@ -57,6 +57,10 @@ public:
     static std::string utf16le_to_utf8(const uint16_t* utf16, size_t len);
     static bool unpack_runs(const uint8_t* run_buf, size_t run_buf_size, std::vector<DataRun>& runs);
 
+    // Public helper methods for testing
+    void test_set_files(const std::unordered_map<uint64_t, FileEntry>& files) { files_ = files; }
+    void test_resolve_all_paths() { resolve_all_paths(); }
+
 private:
     // Raw disk reading helpers
     bool read_disk(uint64_t offset, void* buffer, size_t size);
