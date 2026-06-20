@@ -2,7 +2,6 @@
 
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <cstdint>
 #include <fstream>
 #include "ntfs_structs.h"
@@ -30,14 +29,13 @@ public:
     // Open partition or image file and read boot sector
     bool init(const std::string& dev_path);
     
-    // Parse MFT and build file tree
+    // Parse MFT metadata (runs, sizes)
     bool parse();
 
-    // Get all parsed files
-    const std::unordered_map<uint64_t, FileEntry>& get_files() const { return files_; }
-
-    // Print parsed summary statistics
-    void print_stats() const;
+    // Get MFT record dimensions
+    uint32_t record_size() const { return record_size_; }
+    uint64_t mft_total_size() const { return mft_total_size_; }
+    uint64_t mft_record_count() const { return mft_total_size_ / record_size_; }
 
     // Parse USN Change Journal ($Extend\$UsnJrnl) $J stream
     struct UsnJournalEntry {
@@ -48,18 +46,14 @@ public:
         uint32_t reason = 0;
         uint64_t timestamp = 0; // Win32 FILETIME
     };
-    bool parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t start_usn = 0, uint64_t* next_usn = nullptr);
-    bool update_index_incremental();
-    uint64_t query_current_usn();
-    uint64_t get_last_usn() const { return last_usn_; }
+
+    bool parse_mft_record_to_entry(uint64_t idx, FileEntry& entry);
+    bool parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t usn_mft_idx, uint64_t start_usn = 0, uint64_t* next_usn = nullptr);
+    uint64_t query_current_usn(uint64_t usn_mft_idx);
 
     // Public static helpers for utility and testability
     static std::string utf16le_to_utf8(const uint16_t* utf16, size_t len);
     static bool unpack_runs(const uint8_t* run_buf, size_t run_buf_size, std::vector<DataRun>& runs);
-
-    // Public helper methods for testing
-    void test_set_files(const std::unordered_map<uint64_t, FileEntry>& files) { files_ = files; }
-    void test_resolve_all_paths() { resolve_all_paths(); }
 
 private:
     // Raw disk reading helpers
@@ -81,9 +75,4 @@ private:
     uint64_t mft_total_size_ = 0;
 
     std::vector<DataRun> mft_runs_;
-    std::unordered_map<uint64_t, FileEntry> files_;
-    uint64_t last_usn_ = 0;
-
-    bool parse_mft_record_to_entry(uint64_t idx, FileEntry& entry);
-    void resolve_all_paths();
 };

@@ -328,8 +328,6 @@ bool NtfsParser::read_mft_record(uint64_t record_idx, std::vector<uint8_t>& buf)
 }
 
 bool NtfsParser::parse() {
-    auto start_time = std::chrono::high_resolution_clock::now();
-
     // 1. Read MFT Record 0 ($MFT itself) if not in raw MFT mode
     if (is_raw_mft_) {
         // In raw $MFT mode, total size is already determined, and it is contiguous.
@@ -393,30 +391,6 @@ bool NtfsParser::parse() {
             return false;
         }
     }
-
-    uint64_t num_records = mft_total_size_ / record_size_;
-    std::cout << fmt::format("[MFT Parse] MFT Total Size: {} ({})\n", mft_total_size_, format_size(mft_total_size_));
-    std::cout << fmt::format("[MFT Parse] MFT Records Count: {}\n", num_records);
-
-    // 2. Loop through all MFT records
-    files_.reserve(num_records);
-    for (uint64_t idx = 0; idx < num_records; ++idx) {
-        FileEntry entry;
-        if (parse_mft_record_to_entry(idx, entry)) {
-            files_[idx] = entry;
-        }
-    }
-
-    // 3. Resolve paths
-    resolve_all_paths();
-
-    // 4. Query and initialize last USN
-    last_usn_ = query_current_usn();
-    std::cout << fmt::format("[USN Init] Initialized last USN position to: 0x{:X}\n", last_usn_);
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    std::cout << fmt::format("[Scan Completed] Scanned {} files/dirs in {} ms\n", files_.size(), elapsed.count());
 
     return true;
 }
@@ -519,87 +493,8 @@ bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
     return false;
 }
 
-void NtfsParser::resolve_all_paths() {
-    // Root directory (record 5)
-    files_[5].full_path = "/";
-    files_[5].is_directory = true;
-
-    for (auto& [id, entry] : files_) {
-        if (id == 5) continue;
-
-        std::vector<uint64_t> path_ids;
-        uint64_t curr = id;
-        std::unordered_map<uint64_t, bool> visited;
-
-        while (curr != 5 && curr != 0) {
-            if (visited[curr]) {
-                break; // Cycle detected
-            }
-            visited[curr] = true;
-
-            auto it = files_.find(curr);
-            if (it == files_.end()) {
-                break; // Missing parent record (orphan)
-            }
-
-            path_ids.push_back(curr);
-            curr = it->second.parent_id;
-        }
-
-        std::string path;
-        if (curr == 5) {
-            // Path reached root
-            for (auto r_it = path_ids.rbegin(); r_it != path_ids.rend(); ++r_it) {
-                path += "/" + files_[*r_it].name;
-            }
-        } else {
-            // Orphan path
-            path = "/[orphan]";
-            for (auto r_it = path_ids.rbegin(); r_it != path_ids.rend(); ++r_it) {
-                path += "/" + files_[*r_it].name;
-            }
-        }
-        entry.full_path = path;
-    }
-}
-
-void NtfsParser::print_stats() const {
-    size_t file_count = 0;
-    size_t dir_count = 0;
-    uint64_t total_bytes = 0;
-
-    for (const auto& [id, entry] : files_) {
-        if (entry.is_directory) {
-            dir_count++;
-        } else {
-            file_count++;
-            total_bytes += entry.size;
-        }
-    }
-
-    std::cout << "\n================ NTFS Scan Statistics ================\n";
-    std::cout << fmt::format("Device Path:         {}\n", dev_path_);
-    std::cout << fmt::format("Total Directories:   {}\n", dir_count);
-    std::cout << fmt::format("Total Files:         {}\n", file_count);
-    std::cout << fmt::format("Total Logical Size:  {} ({})\n", total_bytes, format_size(total_bytes));
-    std::cout << "======================================================\n\n";
-}
-
-bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t start_usn, uint64_t* next_usn) {
-    uint64_t usn_mft_idx = 0;
-    bool found_usn_file = false;
-
-    // 1. Locate $UsnJrnl in the pre-parsed files
-    for (const auto& [id, entry] : files_) {
-        // Parent MFT 11 is $Extend
-        if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
-            usn_mft_idx = id;
-            found_usn_file = true;
-            break;
-        }
-    }
-
-    if (!found_usn_file) {
+bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t usn_mft_idx, uint64_t start_usn, uint64_t* next_usn) {
+    if (usn_mft_idx == 0) {
         return false;
     }
 
@@ -868,17 +763,8 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
     return true;
 }
 
-uint64_t NtfsParser::query_current_usn() {
-    uint64_t usn_mft_idx = 0;
-    bool found_usn_file = false;
-    for (const auto& [id, entry] : files_) {
-        if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
-            usn_mft_idx = id;
-            found_usn_file = true;
-            break;
-        }
-    }
-    if (!found_usn_file) return 0;
+uint64_t NtfsParser::query_current_usn(uint64_t usn_mft_idx) {
+    if (usn_mft_idx == 0) return 0;
 
     std::vector<uint8_t> rec_buf;
     if (!read_mft_record(usn_mft_idx, rec_buf)) return 0;
@@ -994,100 +880,5 @@ uint64_t NtfsParser::query_current_usn() {
         }
     }
     return 0;
-}
-
-bool NtfsParser::update_index_incremental() {
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    std::vector<UsnJournalEntry> entries;
-    uint64_t next_usn = last_usn_;
-    if (!parse_usn_journal(entries, last_usn_, &next_usn)) {
-        return false;
-    }
-
-    if (entries.empty()) {
-        std::cout << "No new changes in USN Change Journal. Index is up to date.\n";
-        return true;
-    }
-
-    size_t added = 0;
-    size_t modified = 0;
-    size_t deleted = 0;
-    std::unordered_map<uint64_t, std::string> deleted_names;
-    std::unordered_map<uint64_t, std::string> updated_names;
-
-    for (const auto& entry : entries) {
-        if (entry.reason & 0x00000200) { // DELETE
-            auto it = files_.find(entry.file_id);
-            if (it != files_.end()) {
-                deleted_names[entry.file_id] = it->second.full_path;
-                files_.erase(it);
-                deleted++;
-            }
-            updated_names.erase(entry.file_id);
-        } else {
-            FileEntry file_entry;
-            bool exists_before = (files_.find(entry.file_id) != files_.end());
-            std::string old_path = exists_before ? files_[entry.file_id].full_path : "";
-
-            if (parse_mft_record_to_entry(entry.file_id, file_entry)) {
-                files_[entry.file_id] = file_entry;
-                if (exists_before) {
-                    modified++;
-                    updated_names[entry.file_id] = "Modified: " + old_path;
-                } else {
-                    added++;
-                    updated_names[entry.file_id] = "Added: " + file_entry.name;
-                }
-            } else {
-                auto it = files_.find(entry.file_id);
-                if (it != files_.end()) {
-                    deleted_names[entry.file_id] = it->second.full_path;
-                    files_.erase(it);
-                    deleted++;
-                }
-                updated_names.erase(entry.file_id);
-            }
-        }
-    }
-
-    resolve_all_paths();
-
-    std::cout << "\nIncremental Update Summary:\n";
-    std::cout << fmt::format("  - Files Added:    {}\n", added);
-    std::cout << fmt::format("  - Files Modified: {}\n", modified);
-    std::cout << fmt::format("  - Files Deleted:  {}\n", deleted);
-
-    std::cout << "\nDetail of changes (last 50):\n";
-    size_t print_count = 0;
-    for (const auto& [id, path] : deleted_names) {
-        if (print_count >= 50) break;
-        std::cout << fmt::format("  [DELETED]  {}\n", path);
-        print_count++;
-    }
-    for (const auto& [id, msg] : updated_names) {
-        if (print_count >= 50) break;
-        auto it = files_.find(id);
-        if (it != files_.end()) {
-            if (msg.rfind("Modified:", 0) == 0) {
-                if (msg != "Modified: " + it->second.full_path) {
-                    std::cout << fmt::format("  [RENAMED]   {} -> {}\n", msg.substr(10), it->second.full_path);
-                } else {
-                    std::cout << fmt::format("  [MODIFIED]  {}\n", it->second.full_path);
-                }
-            } else {
-                std::cout << fmt::format("  [ADDED]     {}\n", it->second.full_path);
-            }
-            print_count++;
-        }
-    }
-
-    last_usn_ = next_usn;
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    std::cout << fmt::format("\nIncremental update finished in {} ms. Current USN: 0x{:X}\n\n", 
-        elapsed.count(), last_usn_);
-
-    return true;
 }
 

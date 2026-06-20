@@ -7,6 +7,7 @@
 #include <ctime>
 #include <fmt/format.h>
 #include "ntfs_parser.h"
+#include "ntfs_indexer.h"
 
 namespace {
 
@@ -88,15 +89,22 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "Starting MFT table scan...\n";
+    std::cout << "Starting MFT metadata parse...\n";
     if (!parser.parse()) {
-        std::cerr << "Error: Parsing failed.\n";
+        std::cerr << "Error: MFT parsing failed.\n";
         return 1;
     }
 
-    parser.print_stats();
+    std::cout << "Building initial file index...\n";
+    NtfsIndexer indexer;
+    if (!indexer.build_initial_index(parser)) {
+        std::cerr << "Error: Index build failed.\n";
+        return 1;
+    }
 
-    const auto& files = parser.get_files();
+    indexer.print_stats(dev_path);
+
+    const auto& files = indexer.get_files();
 
     std::cout << "======================================================\n";
     std::cout << "Interactive Search Mode Enabled!\n";
@@ -128,20 +136,34 @@ int main(int argc, char* argv[]) {
         }
 
         if (query == ":stats") {
-            parser.print_stats();
+            indexer.print_stats(dev_path);
             continue;
         }
 
         if (query == ":usn") {
+            // Find usn_mft_idx from the file tree
+            uint64_t usn_mft_idx = 0;
+            for (const auto& [id, entry] : files) {
+                if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
+                    usn_mft_idx = id;
+                    break;
+                }
+            }
+
+            if (usn_mft_idx == 0) {
+                std::cout << "USN Change Journal ($UsnJrnl) is not active on this volume.\n\n";
+                continue;
+            }
+
             std::cout << "Parsing USN Change Journal ($J stream)...\n";
             std::vector<NtfsParser::UsnJournalEntry> usn_entries;
             auto usn_start = std::chrono::high_resolution_clock::now();
-            bool success = parser.parse_usn_journal(usn_entries);
+            bool success = parser.parse_usn_journal(usn_entries, usn_mft_idx);
             auto usn_end = std::chrono::high_resolution_clock::now();
             auto usn_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(usn_end - usn_start);
 
             if (!success) {
-                std::cout << "USN Change Journal ($UsnJrnl) is not active or could not be parsed on this volume.\n\n";
+                std::cout << "USN Change Journal stream could not be parsed on this volume.\n\n";
             } else if (usn_entries.empty()) {
                 std::cout << fmt::format("USN Change Journal parsed successfully in {} ms, but no active records were found (it might be empty or fully truncated).\n\n", usn_elapsed.count());
             } else {
@@ -168,7 +190,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (query == ":update") {
-            parser.update_index_incremental();
+            indexer.update_index_incremental(parser);
             continue;
         }
 

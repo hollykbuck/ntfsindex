@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "../src/ntfs_parser.h"
+#include "../src/ntfs_indexer.h"
 
 TEST_CASE("UTF-16LE to UTF-8 conversion", "[utf16]") {
     // Test basic ASCII conversion
@@ -29,7 +30,7 @@ TEST_CASE("Unpack runs test", "[ntfs]") {
 }
 
 TEST_CASE("Resolve all paths test", "[ntfs]") {
-    NtfsParser parser;
+    NtfsIndexer indexer;
     
     std::unordered_map<uint64_t, FileEntry> mock_files;
     
@@ -60,10 +61,10 @@ TEST_CASE("Resolve all paths test", "[ntfs]") {
     // Cycle Dir Y (record 301) -> parent X
     mock_files[301] = FileEntry{301, 300, "DirY", true, 0, ""};
     
-    parser.test_set_files(mock_files);
-    parser.test_resolve_all_paths();
+    indexer.test_set_files(mock_files);
+    indexer.test_resolve_all_paths();
     
-    const auto& resolved = parser.get_files();
+    const auto& resolved = indexer.get_files();
     
     REQUIRE(resolved.at(5).full_path == "/");
     REQUIRE(resolved.at(100).full_path == "/DirA");

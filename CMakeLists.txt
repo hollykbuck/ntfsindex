@@ -12,6 +12,8 @@ add_executable(ntfsindex
     src/main.cpp
     src/ntfs_parser.cpp
     src/ntfs_parser.h
+    src/ntfs_indexer.cpp
+    src/ntfs_indexer.h
     src/ntfs_structs.h
 )
 
@@ -33,6 +35,8 @@ add_executable(ntfs_tests
     tests/tests.cpp
     src/ntfs_parser.cpp
     src/ntfs_parser.h
+    src/ntfs_indexer.cpp
+    src/ntfs_indexer.h
     src/ntfs_structs.h
 )
 target_link_libraries(ntfs_tests PRIVATE fmt::fmt Catch2::Catch2WithMain)
