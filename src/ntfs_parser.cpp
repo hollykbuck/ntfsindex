@@ -1,10 +1,9 @@
 #include "ntfs_parser.h"
 #include <iostream>
-#include <fcntl.h>
-#include <unistd.h>
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <fmt/format.h>
 
 namespace {
@@ -69,18 +68,64 @@ std::string format_size(uint64_t bytes) {
 NtfsParser::NtfsParser() {}
 
 NtfsParser::~NtfsParser() {
-    if (fd_ != -1) {
-        ::close(fd_);
+    if (stream_.is_open()) {
+        stream_.close();
     }
 }
 
 bool NtfsParser::init(const std::string& dev_path) {
     dev_path_ = dev_path;
-    fd_ = ::open(dev_path_.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd_ == -1) {
-        std::cerr << fmt::format("Error: Failed to open device/file '{}': {}\n", dev_path_, std::strerror(errno));
+    stream_.open(std::filesystem::path(dev_path_), std::ios::binary);
+    if (!stream_) {
+        std::cerr << fmt::format("Error: Failed to open device/file '{}'\n", dev_path_);
         return false;
     }
+
+    uint64_t file_size = 0;
+    try {
+        file_size = std::filesystem::file_size(std::filesystem::path(dev_path_));
+    } catch (...) {
+        // Fallback for some device partitions where file_size may throw
+        stream_.seekg(0, std::ios::end);
+        file_size = stream_.tellg();
+        stream_.seekg(0, std::ios::beg);
+    }
+
+    uint32_t signature = 0;
+    if (file_size >= 4) {
+        if (!read_disk(0, &signature, 4)) {
+            std::cerr << "Error: Failed to read file signature\n";
+            return false;
+        }
+    }
+
+    // Check if signature matches raw MFT record signature ('FILE')
+    if (signature == SIGN_FILE) {
+        is_raw_mft_ = true;
+        sector_size_ = 512;
+        cluster_size_ = 4096;
+        mft_start_offset_ = 0;
+        mft_total_size_ = file_size;
+
+        // Read first record's total size (MFT record total size is at offset 28)
+        uint32_t record_total = 0;
+        if (file_size >= 32 && read_disk(28, &record_total, 4)) {
+            if (record_total == 1024 || record_total == 2048 || record_total == 4096) {
+                record_size_ = record_total;
+            } else {
+                record_size_ = 1024;
+            }
+        } else {
+            record_size_ = 1024;
+        }
+
+        std::cout << fmt::format("[NTFS Info] Input recognized as a raw $MFT binary file.\n");
+        std::cout << fmt::format("[NTFS Info] Total MFT size: {} bytes\n", mft_total_size_);
+        std::cout << fmt::format("[NTFS Info] MFT record size: {} bytes\n", record_size_);
+        return true;
+    }
+
+    is_raw_mft_ = false;
 
     // Read Boot Sector (VBR)
     std::vector<uint8_t> boot_buf(512);
@@ -91,7 +136,7 @@ bool NtfsParser::init(const std::string& dev_path) {
 
     const NTFS_BOOT* boot = reinterpret_cast<const NTFS_BOOT*>(boot_buf.data());
     if (std::memcmp(boot->system_id, "NTFS    ", 8) != 0) {
-        std::cerr << "Error: Device does not contain a valid NTFS filesystem signature.\n";
+        std::cerr << "Error: Device/File does not contain a valid NTFS boot sector or raw $MFT signature.\n";
         return false;
     }
 
@@ -115,23 +160,17 @@ bool NtfsParser::init(const std::string& dev_path) {
 }
 
 bool NtfsParser::read_disk(uint64_t offset, void* buffer, size_t size) {
-    if (fd_ == -1) return false;
-    
-    if (lseek(fd_, offset, SEEK_SET) == -1) {
+    if (size == 0) return true;
+    if (!stream_.is_open()) return false;
+
+    stream_.clear();
+    stream_.seekg(offset, std::ios::beg);
+    if (!stream_) {
         return false;
     }
 
-    uint8_t* ptr = reinterpret_cast<uint8_t*>(buffer);
-    size_t total_read = 0;
-    while (total_read < size) {
-        ssize_t bytes_read = ::read(fd_, ptr + total_read, size - total_read);
-        if (bytes_read <= 0) {
-            if (bytes_read < 0 && errno == EINTR) continue;
-            return false;
-        }
-        total_read += bytes_read;
-    }
-    return true;
+    stream_.read(reinterpret_cast<char*>(buffer), size);
+    return !stream_.fail();
 }
 
 bool NtfsParser::unpack_runs(const uint8_t* run_buf, size_t run_buf_size, std::vector<DataRun>& runs) {
@@ -274,64 +313,68 @@ bool NtfsParser::read_mft_record(uint64_t record_idx, std::vector<uint8_t>& buf)
 bool NtfsParser::parse() {
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // 1. Read MFT Record 0 ($MFT itself)
-    std::vector<uint8_t> mft_rec_buf;
-    if (!read_mft_record(0, mft_rec_buf)) {
-        std::cerr << "Error: Failed to read MFT Record 0\n";
-        return false;
-    }
-
-    if (!apply_fixups(mft_rec_buf.data(), record_size_, 
-                      reinterpret_cast<MFT_REC*>(mft_rec_buf.data())->rhdr.fix_off, 
-                      reinterpret_cast<MFT_REC*>(mft_rec_buf.data())->rhdr.fix_num)) {
-        std::cerr << "Error: MFT Record 0 fixup validation failed\n";
-        return false;
-    }
-
-    MFT_REC* mft_rec = reinterpret_cast<MFT_REC*>(mft_rec_buf.data());
-    if (mft_rec->rhdr.sign != SIGN_FILE) {
-        std::cerr << "Error: MFT Record 0 does not have a valid 'FILE' signature\n";
-        return false;
-    }
-
-    // Parse attributes in MFT Record 0 to extract $DATA run lists
-    uint32_t offset = mft_rec->attr_off;
-    bool found_mft_data = false;
-
-    while (offset + 24 <= mft_rec->used) {
-        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(mft_rec_buf.data() + offset);
-        if (attrib->type == ATTR_END) {
-            break;
+    // 1. Read MFT Record 0 ($MFT itself) if not in raw MFT mode
+    if (is_raw_mft_) {
+        // In raw $MFT mode, total size is already determined, and it is contiguous.
+    } else {
+        std::vector<uint8_t> mft_rec_buf;
+        if (!read_mft_record(0, mft_rec_buf)) {
+            std::cerr << "Error: Failed to read MFT Record 0\n";
+            return false;
         }
 
-        if (offset + attrib->size > mft_rec->used) {
-            break;
+        if (!apply_fixups(mft_rec_buf.data(), record_size_, 
+                          reinterpret_cast<MFT_REC*>(mft_rec_buf.data())->rhdr.fix_off, 
+                          reinterpret_cast<MFT_REC*>(mft_rec_buf.data())->rhdr.fix_num)) {
+            std::cerr << "Error: MFT Record 0 fixup validation failed\n";
+            return false;
         }
 
-        if (attrib->type == ATTR_DATA) {
-            if (attrib->non_res) {
-                // Parse run lists
-                const uint8_t* run_buf = reinterpret_cast<const uint8_t*>(attrib) + attrib->nres.run_off;
-                size_t run_buf_size = attrib->size - attrib->nres.run_off;
-                if (unpack_runs(run_buf, run_buf_size, mft_runs_)) {
-                    mft_total_size_ = attrib->nres.data_size;
+        MFT_REC* mft_rec = reinterpret_cast<MFT_REC*>(mft_rec_buf.data());
+        if (mft_rec->rhdr.sign != SIGN_FILE) {
+            std::cerr << "Error: MFT Record 0 does not have a valid 'FILE' signature\n";
+            return false;
+        }
+
+        // Parse attributes in MFT Record 0 to extract $DATA run lists
+        uint32_t offset = mft_rec->attr_off;
+        bool found_mft_data = false;
+
+        while (offset + 24 <= mft_rec->used) {
+            const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(mft_rec_buf.data() + offset);
+            if (attrib->type == ATTR_END) {
+                break;
+            }
+
+            if (offset + attrib->size > mft_rec->used) {
+                break;
+            }
+
+            if (attrib->type == ATTR_DATA) {
+                if (attrib->non_res) {
+                    // Parse run lists
+                    const uint8_t* run_buf = reinterpret_cast<const uint8_t*>(attrib) + attrib->nres.run_off;
+                    size_t run_buf_size = attrib->size - attrib->nres.run_off;
+                    if (unpack_runs(run_buf, run_buf_size, mft_runs_)) {
+                        mft_total_size_ = attrib->nres.data_size;
+                        found_mft_data = true;
+                    }
+                } else {
+                    // Resident MFT (very small filesystem)
+                    mft_total_size_ = attrib->res.data_size;
                     found_mft_data = true;
                 }
-            } else {
-                // Resident MFT (very small filesystem)
-                mft_total_size_ = attrib->res.data_size;
-                found_mft_data = true;
+                break;
             }
-            break;
+
+            offset += attrib->size;
+            if (attrib->size == 0) break;
         }
 
-        offset += attrib->size;
-        if (attrib->size == 0) break;
-    }
-
-    if (!found_mft_data) {
-        std::cerr << "Error: $DATA attribute not found in MFT Record 0\n";
-        return false;
+        if (!found_mft_data) {
+            std::cerr << "Error: $DATA attribute not found in MFT Record 0\n";
+            return false;
+        }
     }
 
     uint64_t num_records = mft_total_size_ / record_size_;

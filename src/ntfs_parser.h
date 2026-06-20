@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
+#include <fstream>
 #include "ntfs_structs.h"
 
 struct FileEntry {
@@ -51,7 +52,8 @@ private:
     bool apply_fixups(uint8_t* buffer, size_t size, uint16_t fix_off, uint16_t fix_num);
 
     std::string dev_path_;
-    int fd_ = -1;
+    std::ifstream stream_;
+    bool is_raw_mft_ = false;
 
     uint16_t sector_size_ = 512;
     uint32_t cluster_size_ = 4096;

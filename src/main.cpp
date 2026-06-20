@@ -18,9 +18,11 @@ std::string to_lowercase(const std::string& str) {
 }
 
 void print_help(const char* prog_name) {
-    std::cout << fmt::format("Usage: {} <device_or_image_path>\n", prog_name);
-    std::cout << "Example:\n";
-    std::cout << fmt::format("  {} /dev/sdb1        # Scan a physical NTFS partition (requires root)\n", prog_name);
+    std::cout << fmt::format("Usage: {} <mft_file_or_partition_path>\n", prog_name);
+    std::cout << "Examples:\n";
+    std::cout << fmt::format("  {} $MFT              # Scan an exported raw $MFT binary file\n", prog_name);
+    std::cout << fmt::format("  {} \\\\.\\C:           # Scan Windows C: drive directly (requires Administrator privileges)\n", prog_name);
+    std::cout << fmt::format("  {} /dev/sdb1         # Scan a Linux physical NTFS partition (requires root)\n", prog_name);
     std::cout << fmt::format("  {} test_ntfs.img     # Scan a backup/test NTFS image file\n", prog_name);
 }
 
