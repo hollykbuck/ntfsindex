@@ -20,14 +20,17 @@ jobs:
             artifact_name: ntfsindex-linux-amd64
             binary_name: ntfsindex
             archive_ext: tar.gz
+            configure_preset: conan-release
           - os: macos-latest
             artifact_name: ntfsindex-macos-arm64
             binary_name: ntfsindex
             archive_ext: tar.gz
+            configure_preset: conan-release
           - os: windows-latest
             artifact_name: ntfsindex-windows-amd64
             binary_name: ntfsindex.exe
             archive_ext: zip
+            configure_preset: conan-default
 
     steps:
       - name: Checkout repository
@@ -44,7 +47,7 @@ jobs:
 
       - name: Configure CMake
         run: |
-          cmake --preset conan-release
+          cmake --preset ${{ matrix.configure_preset }}
 
       - name: Build
         run: |
