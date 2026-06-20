@@ -553,3 +553,154 @@ void NtfsParser::print_stats() const {
     std::cout << fmt::format("Total Logical Size:  {} ({})\n", total_bytes, format_size(total_bytes));
     std::cout << "======================================================\n\n";
 }
+
+bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries) {
+    uint64_t usn_mft_idx = 0;
+    bool found_usn_file = false;
+
+    // 1. Locate $UsnJrnl in the pre-parsed files
+    for (const auto& [id, entry] : files_) {
+        // Parent MFT 11 is $Extend
+        if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
+            usn_mft_idx = id;
+            found_usn_file = true;
+            break;
+        }
+    }
+
+    if (!found_usn_file) {
+        return false;
+    }
+
+    // 2. Read $UsnJrnl MFT record
+    std::vector<uint8_t> rec_buf;
+    if (!read_mft_record(usn_mft_idx, rec_buf)) {
+        std::cerr << "Error: Failed to read MFT record for $UsnJrnl.\n";
+        return false;
+    }
+    
+    MFT_REC* rec = reinterpret_cast<MFT_REC*>(rec_buf.data());
+    if (!apply_fixups(rec_buf.data(), record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
+        std::cerr << "Error: MFT record fixup verification failed for $UsnJrnl.\n";
+        return false;
+    }
+
+    // 3. Locate the $J Data Stream attribute
+    const ATTRIB* j_attrib = nullptr;
+    uint32_t attr_offset = rec->attr_off;
+    while (attr_offset + 24 <= rec->used) {
+        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(rec_buf.data() + attr_offset);
+        if (attrib->type == ATTR_END) break;
+        if (attr_offset + attrib->size > rec->used) break;
+
+        if (attrib->type == ATTR_DATA) {
+            // Check name of stream
+            if (attrib->name_len > 0) {
+                const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
+                    reinterpret_cast<const uint8_t*>(attrib) + attrib->name_off
+                );
+                // Check if name is "$J" (2 characters)
+                if (attrib->name_len == 2 && name_ptr[0] == 0x0024 && name_ptr[1] == 0x004A) {
+                    j_attrib = attrib;
+                    break;
+                }
+            }
+        }
+        attr_offset += attrib->size;
+        if (attrib->size == 0) break;
+    }
+
+    if (!j_attrib) {
+        std::cerr << "Error: $J stream attribute not found in $UsnJrnl.\n";
+        return false;
+    }
+
+    if (!j_attrib->non_res) {
+        std::cerr << "Error: $J stream attribute is resident (unexpected for change journal).\n";
+        return false;
+    }
+
+    // 4. Unpack $J runs
+    std::vector<DataRun> j_runs;
+    const uint8_t* run_buf = reinterpret_cast<const uint8_t*>(j_attrib) + j_attrib->nres.run_off;
+    size_t run_buf_size = j_attrib->size - j_attrib->nres.run_off;
+    if (!unpack_runs(run_buf, run_buf_size, j_runs)) {
+        std::cerr << "Error: Failed to unpack runs for $J stream.\n";
+        return false;
+    }
+
+    uint64_t j_stream_size = j_attrib->nres.data_size;
+
+    // 5. Find the start of active (non-sparse) data
+    uint64_t active_offset = 0;
+    for (const auto& run : j_runs) {
+        if (run.lcn != -1) {
+            active_offset = run.vcn * cluster_size_;
+            break;
+        }
+    }
+
+    std::cout << fmt::format("[USN Parse] $J stream size: {} bytes\n", j_stream_size);
+    std::cout << fmt::format("[USN Parse] First active record offset: 0x{:X}\n", active_offset);
+
+    // 6. Read and parse USN records sequentially
+    uint64_t curr_offset = active_offset;
+    std::vector<uint8_t> block_buf(256 * 1024); // Read in 256KB chunks
+
+    while (curr_offset < j_stream_size) {
+        size_t bytes_to_read = std::min(block_buf.size(), static_cast<size_t>(j_stream_size - curr_offset));
+        if (bytes_to_read < sizeof(USN_RECORD_V2)) break;
+
+        if (!read_from_runs(j_runs, curr_offset, block_buf.data(), bytes_to_read)) {
+            std::cerr << fmt::format("Error: Failed reading stream at offset 0x{:X}\n", curr_offset);
+            break;
+        }
+
+        size_t block_offset = 0;
+        while (block_offset + sizeof(USN_RECORD_V2) <= bytes_to_read) {
+            const USN_RECORD_V2* record = reinterpret_cast<const USN_RECORD_V2*>(block_buf.data() + block_offset);
+
+            // If we encounter a zero-length padding block (e.g. alignment fill or unwritten space)
+            if (record->record_length == 0) {
+                // If it is all zeroes, skip to the next 8-byte boundary or the next sector
+                block_offset += 8;
+                curr_offset += 8;
+                continue;
+            }
+
+            // Boundary validation
+            if (block_offset + record->record_length > bytes_to_read) {
+                // The record spans across the chunk boundary, reload at curr_offset
+                break;
+            }
+
+            // Self-validation: Verify the USN offset matches the stream offset
+            if (record->major_version == 2 && record->usn == curr_offset) {
+                UsnJournalEntry entry;
+                entry.usn = record->usn;
+                entry.file_id = record->file_reference_number & 0x0000FFFFFFFFFFFFULL; // Lower 48-bits
+                entry.parent_id = record->parent_file_ref_num & 0x0000FFFFFFFFFFFFULL;
+                entry.reason = record->reason;
+                entry.timestamp = record->timestamp;
+
+                // Extract filename
+                if (record->name_offset + record->name_length <= record->record_length) {
+                    const uint16_t* name_ptr = reinterpret_cast<const uint16_t*>(
+                        reinterpret_cast<const uint8_t*>(record) + record->name_offset
+                    );
+                    entry.filename = utf16le_to_utf8(name_ptr, record->name_length / 2);
+                }
+
+                entries.push_back(entry);
+            }
+
+            // Advance by record length, aligned to 8 bytes
+            uint32_t aligned_len = (record->record_length + 7) & ~7;
+            block_offset += aligned_len;
+            curr_offset += aligned_len;
+        }
+    }
+
+    return true;
+}
+

@@ -171,4 +171,40 @@ struct ATTR_FILE_NAME {
     uint16_t      name[1];  // Variable-sized name (UTF-16LE)
 };
 
+// USN Record V2 (Commonly used in NTFS)
+struct USN_RECORD_V2 {
+    uint32_t record_length;
+    uint16_t major_version;
+    uint16_t minor_version;
+    uint64_t file_reference_number;
+    uint64_t parent_file_ref_num;
+    uint64_t usn;
+    uint64_t timestamp;
+    uint32_t reason;
+    uint32_t source_info;
+    uint32_t security_id;
+    uint32_t file_attributes;
+    uint16_t name_length;
+    uint16_t name_offset;
+    uint16_t name[1];
+};
+
+// USN Record V3 (Used in ReFS and newer NTFS)
+struct USN_RECORD_V3 {
+    uint32_t record_length;
+    uint16_t major_version;
+    uint16_t minor_version;
+    uint8_t  file_reference_number[16];
+    uint8_t  parent_file_ref_num[16];
+    uint64_t usn;
+    uint64_t timestamp;
+    uint32_t reason;
+    uint32_t source_info;
+    uint32_t security_id;
+    uint32_t file_attributes;
+    uint16_t name_length;
+    uint16_t name_offset;
+    uint16_t name[1];
+};
+
 #pragma pack(pop)

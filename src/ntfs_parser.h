@@ -39,6 +39,17 @@ public:
     // Print parsed summary statistics
     void print_stats() const;
 
+    // Parse USN Change Journal ($Extend\$UsnJrnl) $J stream
+    struct UsnJournalEntry {
+        uint64_t usn = 0;
+        uint64_t file_id = 0;
+        uint64_t parent_id = 0;
+        std::string filename;
+        uint32_t reason = 0;
+        uint64_t timestamp = 0; // Win32 FILETIME
+    };
+    bool parse_usn_journal(std::vector<UsnJournalEntry>& entries);
+
 private:
     // Raw disk reading helpers
     bool read_disk(uint64_t offset, void* buffer, size_t size);
