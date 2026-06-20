@@ -1,0 +1,94 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Release Binary for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: ntfsindex-linux-amd64
+            binary_name: ntfsindex
+            archive_ext: tar.gz
+          - os: macos-latest
+            artifact_name: ntfsindex-macos-arm64
+            binary_name: ntfsindex
+            archive_ext: tar.gz
+          - os: windows-latest
+            artifact_name: ntfsindex-windows-amd64
+            binary_name: ntfsindex.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install and configure Conan
+        uses: conan-io/setup-conan@v1
+        with:
+          cache_packages: true
+
+      - name: Install dependencies via Conan
+        run: |
+          conan install . --build=missing -s build_type=Release -s compiler.cppstd=20
+
+      - name: Configure CMake
+        run: |
+          cmake --preset conan-release
+
+      - name: Build
+        run: |
+          cmake --build --preset conan-release
+
+      - name: Package Release Binary
+        shell: bash
+        run: |
+          BINARY_PATH=$(find build/Release -name "${{ matrix.binary_name }}")
+          echo "Found binary at: $BINARY_PATH"
+          mkdir -p dist
+          cp "$BINARY_PATH" dist/
+          
+          if [ "${{ matrix.archive_ext }}" = "tar.gz" ]; then
+            tar -czf "${{ matrix.artifact_name }}.tar.gz" -C dist "${{ matrix.binary_name }}"
+          else
+            # On Windows runner, standard 7z is preinstalled and works perfectly
+            7z a "${{ matrix.artifact_name }}.zip" ./dist/${{ matrix.binary_name }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          merge-multiple: true
+
+      - name: Display downloaded files
+        run: ls -l dist-release
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
