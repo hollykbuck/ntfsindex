@@ -1,0 +1,6 @@
+{
+  "device_path": "$MFT",
+  "port": 8080,
+  "address": "0.0.0.0",
+  "doc_root": "./web"
+}
