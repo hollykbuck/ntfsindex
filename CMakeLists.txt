@@ -12,6 +12,7 @@ endif()
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(absl REQUIRED)
 
 # Executable definition
 add_executable(ntfsindex
@@ -26,7 +27,7 @@ add_executable(ntfsindex
 )
 
 # Link dependencies
-target_link_libraries(ntfsindex PRIVATE fmt::fmt boost::boost nlohmann_json::nlohmann_json)
+target_link_libraries(ntfsindex PRIVATE fmt::fmt boost::boost nlohmann_json::nlohmann_json absl::flags absl::flags_parse)
 
 # Enable compiler warnings
 if(MSVC)

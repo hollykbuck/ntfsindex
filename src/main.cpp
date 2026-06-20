@@ -5,10 +5,15 @@
 #include <cctype>
 #include <chrono>
 #include <ctime>
+#include <fstream>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 #include "ntfs_parser.h"
 #include "ntfs_indexer.h"
 #include "http_server.h"
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/flags/usage.h"
 
 namespace {
 
@@ -61,44 +66,99 @@ std::string format_filetime(uint64_t filetime) {
     return std::string(buf);
 }
 
-void print_help(const char* prog_name) {
-    std::cout << fmt::format("Usage: {} <mft_file_or_partition_path> [port] [doc_root]\n", prog_name);
-    std::cout << "Examples:\n";
-    std::cout << fmt::format("  {} $MFT              # Scan MFT file and serve on http://127.0.0.1:8080/\n", prog_name);
-    std::cout << fmt::format("  {} \\\\.\\C: 9000       # Scan C: drive and serve on http://127.0.0.1:9000/\n", prog_name);
+struct AppConfig {
+    std::string device_path = "$MFT";
+    uint16_t port = 8080;
+    std::string address = "0.0.0.0";
+    std::string doc_root = "./web";
+};
+
+AppConfig load_config(const std::string& path) {
+    AppConfig config;
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cout << "[Config] Configuration file not found or couldn't be opened: " << path << ". Using defaults.\n";
+        return config;
+    }
+    try {
+        nlohmann::json j;
+        f >> j;
+        if (j.contains("device_path") && j["device_path"].is_string()) {
+            config.device_path = j["device_path"].get<std::string>();
+        }
+        if (j.contains("port") && j["port"].is_number_integer()) {
+            config.port = j["port"].get<uint16_t>();
+        }
+        if (j.contains("address") && j["address"].is_string()) {
+            config.address = j["address"].get<std::string>();
+        }
+        if (j.contains("doc_root") && j["doc_root"].is_string()) {
+            config.doc_root = j["doc_root"].get<std::string>();
+        }
+        std::cout << "[Config] Loaded configuration from: " << path << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[Config] Error parsing " << path << ": " << e.what() << ". Using defaults.\n";
+    }
+    return config;
 }
 
 } // namespace
 
+// Define Abseil command line flags
+ABSL_FLAG(std::string, device_path, "", "Path to raw MFT file or partition (e.g. \\\\.\\C: or $MFT)");
+ABSL_FLAG(uint16_t, port, 0, "Port for the HTTP API server (e.g. 8080)");
+ABSL_FLAG(std::string, address, "", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
+ABSL_FLAG(std::string, doc_root, "", "Document root directory serving frontend assets");
+ABSL_FLAG(std::string, config, "config.json", "Path to config.json file containing default options");
+
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        print_help(argv[0]);
-        return 1;
-    }
+    // Initialize Abseil Program Usage and Parse CommandLine
+    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using config.json, arguments, or flags.");
+    auto positional_args = absl::ParseCommandLine(argc, argv);
 
-    std::string dev_path = argv[1];
-    if (dev_path == "-h" || dev_path == "--help") {
-        print_help(argv[0]);
-        return 0;
-    }
+    // 1. Load config file
+    std::string config_path = absl::GetFlag(FLAGS_config);
+    AppConfig config = load_config(config_path);
 
-    unsigned short port = 8080;
-    if (argc >= 3) {
+    // 2. Override with legacy positional arguments if provided
+    // Usage: prog_name <device_path> [port] [doc_root]
+    if (positional_args.size() >= 2) {
+        config.device_path = positional_args[1];
+    }
+    if (positional_args.size() >= 3) {
         try {
-            port = static_cast<unsigned short>(std::stoul(argv[2]));
-        } catch (...) {
-            std::cerr << "Invalid port number specified. Using default 8080.\n";
-        }
+            config.port = static_cast<uint16_t>(std::stoul(positional_args[2]));
+        } catch (...) {}
+    }
+    if (positional_args.size() >= 4) {
+        config.doc_root = positional_args[3];
     }
 
-    std::string doc_root = "./web";
-    if (argc >= 4) {
-        doc_root = argv[3];
+    // 3. Override with explicit Abseil flags if specified on CLI
+    if (!absl::GetFlag(FLAGS_device_path).empty()) {
+        config.device_path = absl::GetFlag(FLAGS_device_path);
+    }
+    if (absl::GetFlag(FLAGS_port) != 0) {
+        config.port = absl::GetFlag(FLAGS_port);
+    }
+    if (!absl::GetFlag(FLAGS_address).empty()) {
+        config.address = absl::GetFlag(FLAGS_address);
+    }
+    if (!absl::GetFlag(FLAGS_doc_root).empty()) {
+        config.doc_root = absl::GetFlag(FLAGS_doc_root);
     }
 
-    std::cout << fmt::format("Initializing parser for device: {} ...\n", dev_path);
+    std::cout << "---------------------------------------------\n";
+    std::cout << "[Server Config Options]\n";
+    std::cout << fmt::format("  - Device/MFT Path: {}\n", config.device_path);
+    std::cout << fmt::format("  - Listen Address:  {}\n", config.address);
+    std::cout << fmt::format("  - Listen Port:     {}\n", config.port);
+    std::cout << fmt::format("  - Frontend Root:   {}\n", config.doc_root);
+    std::cout << "---------------------------------------------\n";
+
+    std::cout << fmt::format("Initializing parser for device: {} ...\n", config.device_path);
     NtfsParser parser;
-    if (!parser.init(dev_path)) {
+    if (!parser.init(config.device_path)) {
         return 1;
     }
 
@@ -115,10 +175,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    indexer.print_stats(dev_path);
+    indexer.print_stats(config.device_path);
 
-    std::string address = "0.0.0.0"; // Bind to all network interfaces
-    HttpServer server(parser, indexer, address, port, doc_root, dev_path);
+    HttpServer server(parser, indexer, config.address, config.port, config.doc_root, config.device_path);
     if (!server.run()) {
         return 1;
     }
