@@ -1,3 +1,6 @@
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include <iostream>
 #include <string>
 #include <vector>
@@ -15,8 +18,55 @@
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/flags/usage.h"
+#include "absl/log/log.h"
+#include "absl/log/initialize.h"
+#include "absl/log/log_sink.h"
+#include "absl/log/log_sink_registry.h"
+#include "absl/log/globals.h"
+#include "absl/base/log_severity.h"
+#include <mutex>
+#include <cstdlib>
+#include <memory>
 
 namespace {
+
+class FileLogSink : public absl::LogSink {
+ public:
+  explicit FileLogSink(const std::string& filename) : file_(filename, std::ios::app) {}
+  ~FileLogSink() override {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (file_.is_open()) {
+          file_.close();
+      }
+  }
+
+  void Send(const absl::LogEntry& entry) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (file_.is_open()) {
+      file_ << entry.text_message_with_prefix_and_newline();
+      file_.flush();
+    }
+  }
+
+ private:
+  std::ofstream file_;
+  std::mutex mutex_;
+};
+
+class ScopedFileLogger {
+public:
+    explicit ScopedFileLogger(const std::string& filename) {
+        sink_ = std::make_unique<FileLogSink>(filename);
+        absl::AddLogSink(sink_.get());
+    }
+    ~ScopedFileLogger() {
+        if (sink_) {
+            absl::RemoveLogSink(sink_.get());
+        }
+    }
+private:
+    std::unique_ptr<FileLogSink> sink_;
+};
 
 std::string to_lowercase(const std::string& str) {
     std::string lower = str;
@@ -78,7 +128,7 @@ AppConfig load_config(const std::string& path) {
     AppConfig config;
     std::ifstream f(path);
     if (!f.is_open()) {
-        std::cout << "[Config] Configuration file not found or couldn't be opened: " << path << ". Using defaults.\n";
+        LOG(INFO) << "[Config] Configuration file not found or couldn't be opened: " << path << ". Using defaults.";
         return config;
     }
     try {
@@ -96,9 +146,9 @@ AppConfig load_config(const std::string& path) {
         if (j.contains("doc_root") && j["doc_root"].is_string()) {
             config.doc_root = j["doc_root"].get<std::string>();
         }
-        std::cout << "[Config] Loaded configuration from: " << path << "\n";
+        LOG(INFO) << "[Config] Loaded configuration from: " << path;
     } catch (const std::exception& e) {
-        std::cerr << "[Config] Error parsing " << path << ": " << e.what() << ". Using defaults.\n";
+        LOG(ERROR) << "[Config] Error parsing " << path << ": " << e.what() << ". Using defaults.";
     }
     return config;
 }
@@ -117,6 +167,21 @@ int main(int argc, char* argv[]) {
     // Initialize Abseil Program Usage and Parse CommandLine
     absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using config.json, arguments, or flags.");
     auto positional_args = absl::ParseCommandLine(argc, argv);
+
+    // Initialize Abseil Logging
+    absl::InitializeLog();
+
+    // Set up file logging if environment variable is set
+    std::unique_ptr<ScopedFileLogger> file_logger;
+    const char* log_file_env = std::getenv("NTFSINDEX_LOG_FILE");
+    if (log_file_env && log_file_env[0] != '\0') {
+        file_logger = std::make_unique<ScopedFileLogger>(log_file_env);
+    }
+
+    // Silence stderr logging in TUI mode to avoid terminal corruption
+    if (absl::GetFlag(FLAGS_tui)) {
+        absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
+    }
 
     // 1. Load config file
     std::string config_path = absl::GetFlag(FLAGS_config);
@@ -150,30 +215,30 @@ int main(int argc, char* argv[]) {
         config.doc_root = absl::GetFlag(FLAGS_doc_root);
     }
 
-    std::cout << "---------------------------------------------\n";
-    std::cout << "[Server Config Options]\n";
-    std::cout << fmt::format("  - Device/MFT Path: {}\n", config.device_path);
-    std::cout << fmt::format("  - Listen Address:  {}\n", config.address);
-    std::cout << fmt::format("  - Listen Port:     {}\n", config.port);
-    std::cout << fmt::format("  - Frontend Root:   {}\n", config.doc_root);
-    std::cout << "---------------------------------------------\n";
+    LOG(INFO) << "---------------------------------------------";
+    LOG(INFO) << "[Server Config Options]";
+    LOG(INFO) << fmt::format("  - Device/MFT Path: {}", config.device_path);
+    LOG(INFO) << fmt::format("  - Listen Address:  {}", config.address);
+    LOG(INFO) << fmt::format("  - Listen Port:     {}", config.port);
+    LOG(INFO) << fmt::format("  - Frontend Root:   {}", config.doc_root);
+    LOG(INFO) << "---------------------------------------------";
 
-    std::cout << fmt::format("Initializing parser for device: {} ...\n", config.device_path);
+    LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
     NtfsParser parser;
     if (!parser.init(config.device_path)) {
         return 1;
     }
 
-    std::cout << "Starting MFT metadata parse...\n";
+    LOG(INFO) << "Starting MFT metadata parse...";
     if (!parser.parse()) {
-        std::cerr << "Error: MFT parsing failed.\n";
+        LOG(ERROR) << "Error: MFT parsing failed.";
         return 1;
     }
 
-    std::cout << "Building initial file index...\n";
+    LOG(INFO) << "Building initial file index...";
     NtfsIndexer indexer;
     if (!indexer.build_initial_index(parser)) {
-        std::cerr << "Error: Index build failed.\n";
+        LOG(ERROR) << "Error: Index build failed.";
         return 1;
     }
 

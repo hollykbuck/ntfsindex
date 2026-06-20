@@ -1,5 +1,6 @@
 #include "http_server.h"
 #include "ntfs_parser.h"
+#include "absl/log/log.h"
 #include "ntfs_indexer.h"
 
 #include <boost/beast/core.hpp>
@@ -547,8 +548,8 @@ bool HttpServer::run() {
     try {
         net::io_context ioc{1};
         tcp::acceptor acceptor{ioc, {net::ip::make_address(address_), port_}};
-        std::cout << fmt::format("[HTTP Server] Listening on http://{}:{}/\n", address_, port_);
-        std::cout << fmt::format("[HTTP Server] Serving static files from: {}\n", doc_root_);
+        LOG(INFO) << fmt::format("[HTTP Server] Listening on http://{}:{}/", address_, port_);
+        LOG(INFO) << fmt::format("[HTTP Server] Serving static files from: {}", doc_root_);
 
         for(;;) {
             tcp::socket socket{ioc};
@@ -565,7 +566,7 @@ bool HttpServer::run() {
             ).detach();
         }
     } catch (const std::exception& e) {
-        std::cerr << "[HTTP Server] Error: " << e.what() << std::endl;
+        LOG(ERROR) << "[HTTP Server] Error: " << e.what();
         return false;
     }
     return true;

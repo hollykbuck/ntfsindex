@@ -1,5 +1,6 @@
 #include "ntfs_parser.h"
 #include <iostream>
+#include "absl/log/log.h"
 #include <cstring>
 #include <algorithm>
 #include <chrono>
@@ -77,7 +78,7 @@ bool NtfsParser::init(const std::string& dev_path) {
     dev_path_ = dev_path;
     stream_.open(std::filesystem::path(dev_path_), std::ios::binary);
     if (!stream_) {
-        std::cerr << fmt::format("Error: Failed to open device/file '{}'\n", dev_path_);
+        LOG(ERROR) << fmt::format("Error: Failed to open device/file '{}'", dev_path_);
         return false;
     }
 
@@ -94,7 +95,7 @@ bool NtfsParser::init(const std::string& dev_path) {
     uint32_t signature = 0;
     if (file_size >= 4) {
         if (!read_disk(0, &signature, 4)) {
-            std::cerr << "Error: Failed to read file signature\n";
+            LOG(ERROR) << "Error: Failed to read file signature";
             return false;
         }
     }
@@ -119,9 +120,9 @@ bool NtfsParser::init(const std::string& dev_path) {
             record_size_ = 1024;
         }
 
-        std::cout << fmt::format("[NTFS Info] Input recognized as a raw $MFT binary file.\n");
-        std::cout << fmt::format("[NTFS Info] Total MFT size: {} bytes\n", mft_total_size_);
-        std::cout << fmt::format("[NTFS Info] MFT record size: {} bytes\n", record_size_);
+        LOG(INFO) << "[NTFS Info] Input recognized as a raw $MFT binary file.";
+        LOG(INFO) << fmt::format("[NTFS Info] Total MFT size: {} bytes", mft_total_size_);
+        LOG(INFO) << fmt::format("[NTFS Info] MFT record size: {} bytes", record_size_);
         return true;
     }
 
@@ -130,13 +131,13 @@ bool NtfsParser::init(const std::string& dev_path) {
     // Read Boot Sector (VBR)
     std::vector<uint8_t> boot_buf(512);
     if (!read_disk(0, boot_buf.data(), 512)) {
-        std::cerr << "Error: Failed to read Boot Sector\n";
+        LOG(ERROR) << "Error: Failed to read Boot Sector";
         return false;
     }
 
     const NTFS_BOOT* boot = reinterpret_cast<const NTFS_BOOT*>(boot_buf.data());
     if (std::memcmp(boot->system_id, "NTFS    ", 8) != 0) {
-        std::cerr << "Error: Device/File does not contain a valid NTFS boot sector or raw $MFT signature.\n";
+        LOG(ERROR) << "Error: Device/File does not contain a valid NTFS boot sector or raw $MFT signature.";
         return false;
     }
 
@@ -151,10 +152,10 @@ bool NtfsParser::init(const std::string& dev_path) {
 
     mft_start_offset_ = boot->mft_clst * cluster_size_;
 
-    std::cout << fmt::format("[NTFS Info] Sector size: {} bytes\n", sector_size_);
-    std::cout << fmt::format("[NTFS Info] Cluster size: {} bytes\n", cluster_size_);
-    std::cout << fmt::format("[NTFS Info] MFT record size: {} bytes\n", record_size_);
-    std::cout << fmt::format("[NTFS Info] MFT start cluster: {} (Offset: 0x{:X})\n", boot->mft_clst, mft_start_offset_);
+    LOG(INFO) << fmt::format("[NTFS Info] Sector size: {} bytes", sector_size_);
+    LOG(INFO) << fmt::format("[NTFS Info] Cluster size: {} bytes", cluster_size_);
+    LOG(INFO) << fmt::format("[NTFS Info] MFT record size: {} bytes", record_size_);
+    LOG(INFO) << fmt::format("[NTFS Info] MFT start cluster: {} (Offset: 0x{:X})", boot->mft_clst, mft_start_offset_);
 
     return true;
 }
@@ -334,20 +335,20 @@ bool NtfsParser::parse() {
     } else {
         std::vector<uint8_t> mft_rec_buf;
         if (!read_mft_record(0, mft_rec_buf)) {
-            std::cerr << "Error: Failed to read MFT Record 0\n";
+            LOG(ERROR) << "Error: Failed to read MFT Record 0";
             return false;
         }
 
         if (!apply_fixups(mft_rec_buf.data(), record_size_, 
                           reinterpret_cast<MFT_REC*>(mft_rec_buf.data())->rhdr.fix_off, 
                           reinterpret_cast<MFT_REC*>(mft_rec_buf.data())->rhdr.fix_num)) {
-            std::cerr << "Error: MFT Record 0 fixup validation failed\n";
+            LOG(ERROR) << "Error: MFT Record 0 fixup validation failed";
             return false;
         }
 
         MFT_REC* mft_rec = reinterpret_cast<MFT_REC*>(mft_rec_buf.data());
         if (mft_rec->rhdr.sign != SIGN_FILE) {
-            std::cerr << "Error: MFT Record 0 does not have a valid 'FILE' signature\n";
+            LOG(ERROR) << "Error: MFT Record 0 does not have a valid 'FILE' signature";
             return false;
         }
 
@@ -387,7 +388,7 @@ bool NtfsParser::parse() {
         }
 
         if (!found_mft_data) {
-            std::cerr << "Error: $DATA attribute not found in MFT Record 0\n";
+            LOG(ERROR) << "Error: $DATA attribute not found in MFT Record 0";
             return false;
         }
     }
@@ -501,13 +502,13 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
     // 2. Read $UsnJrnl MFT record
     std::vector<uint8_t> rec_buf;
     if (!read_mft_record(usn_mft_idx, rec_buf)) {
-        std::cerr << "Error: Failed to read MFT record for $UsnJrnl.\n";
+        LOG(ERROR) << "Error: Failed to read MFT record for $UsnJrnl.";
         return false;
     }
     
     MFT_REC* rec = reinterpret_cast<MFT_REC*>(rec_buf.data());
     if (!apply_fixups(rec_buf.data(), record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
-        std::cerr << "Error: MFT record fixup verification failed for $UsnJrnl.\n";
+        LOG(ERROR) << "Error: MFT record fixup verification failed for $UsnJrnl.";
         return false;
     }
 
@@ -551,7 +552,7 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
                 found_j_stream = true;
             }
         } else {
-            std::cerr << "Error: $J stream attribute in base record is resident (unexpected for change journal).\n";
+            LOG(ERROR) << "Error: $J stream attribute in base record is resident (unexpected for change journal).";
             return false;
         }
     } else if (al_attrib) {
@@ -571,7 +572,7 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
             if (unpack_runs(run_buf, run_buf_size, al_runs)) {
                 attr_list_buf.resize(al_attrib->nres.data_size);
                 if (!read_from_runs(al_runs, 0, attr_list_buf.data(), attr_list_buf.size())) {
-                    std::cerr << "Error: Failed to read non-resident attribute list.\n";
+                    LOG(ERROR) << "Error: Failed to read non-resident attribute list.";
                     return false;
                 }
             }
@@ -660,17 +661,17 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
                 std::sort(j_runs.begin(), j_runs.end(), [](const DataRun& a, const DataRun& b) {
                     return a.vcn < b.vcn;
                 });
-                std::cout << "[USN Debug] j_runs size: " << j_runs.size() << "\n";
+                LOG(INFO) << "[USN Debug] j_runs size: " << j_runs.size();
                 if (!j_runs.empty()) {
-                    std::cout << fmt::format("  First Run: VCN {} to {}, LCN {}\n", j_runs.front().vcn, j_runs.front().vcn + j_runs.front().length, j_runs.front().lcn);
-                    std::cout << fmt::format("  Last Run: VCN {} to {}, LCN {}\n", j_runs.back().vcn, j_runs.back().vcn + j_runs.back().length, j_runs.back().lcn);
+                    LOG(INFO) << fmt::format("  First Run: VCN {} to {}, LCN {}", j_runs.front().vcn, j_runs.front().vcn + j_runs.front().length, j_runs.front().lcn);
+                    LOG(INFO) << fmt::format("  Last Run: VCN {} to {}, LCN {}", j_runs.back().vcn, j_runs.back().vcn + j_runs.back().length, j_runs.back().lcn);
                 }
             }
         }
     }
 
     if (!found_j_stream) {
-        std::cerr << "Error: $J stream attribute not found in $UsnJrnl MFT base or extension records.\n";
+        LOG(ERROR) << "Error: $J stream attribute not found in $UsnJrnl MFT base or extension records.";
         return false;
     }
 
@@ -683,17 +684,17 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
         }
     }
 
-    std::cout << fmt::format("[USN Parse] $J stream size: {} bytes\n", j_stream_size);
-    std::cout << fmt::format("[USN Parse] First active record offset: 0x{:X}\n", active_offset);
+    LOG(INFO) << fmt::format("[USN Parse] $J stream size: {} bytes", j_stream_size);
+    LOG(INFO) << fmt::format("[USN Parse] First active record offset: 0x{:X}", active_offset);
 
     // 6. Read and parse USN records sequentially
     uint64_t curr_offset = active_offset;
     if (start_usn > 0) {
         if (start_usn < active_offset) {
-            std::cout << fmt::format("[USN Parse] start_usn 0x{:X} is older than active offset 0x{:X}. Journal was truncated.\n", start_usn, active_offset);
+            LOG(INFO) << fmt::format("[USN Parse] start_usn 0x{:X} is older than active offset 0x{:X}. Journal was truncated.", start_usn, active_offset);
             curr_offset = active_offset;
         } else if (start_usn > j_stream_size) {
-            std::cout << fmt::format("[USN Parse] start_usn 0x{:X} is beyond stream size 0x{:X}.\n", start_usn, j_stream_size);
+            LOG(INFO) << fmt::format("[USN Parse] start_usn 0x{:X} is beyond stream size 0x{:X}.", start_usn, j_stream_size);
             curr_offset = j_stream_size;
         } else {
             curr_offset = start_usn;
@@ -707,7 +708,7 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
         if (bytes_to_read < sizeof(USN_RECORD_V2)) break;
 
         if (!read_from_runs(j_runs, curr_offset, block_buf.data(), bytes_to_read)) {
-            std::cerr << fmt::format("Error: Failed reading stream at offset 0x{:X}\n", curr_offset);
+            LOG(ERROR) << fmt::format("Error: Failed reading stream at offset 0x{:X}", curr_offset);
             break;
         }
 

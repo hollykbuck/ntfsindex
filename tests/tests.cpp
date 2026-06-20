@@ -1,5 +1,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include "../src/ntfs_parser.h"
+#include "absl/log/initialize.h"
+
+namespace {
+struct AbseilLogInitializer {
+    AbseilLogInitializer() {
+        absl::InitializeLog();
+    }
+};
+static AbseilLogInitializer g_abseil_log_initializer;
+} // namespace
 #include "../src/ntfs_indexer.h"
 
 TEST_CASE("UTF-16LE to UTF-8 conversion", "[utf16]") {

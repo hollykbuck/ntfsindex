@@ -36,6 +36,8 @@ target_link_libraries(ntfsindex PRIVATE
     nlohmann_json::nlohmann_json
     absl::flags
     absl::flags_parse
+    absl::log
+    absl::log_initialize
     ftxui::screen
     ftxui::dom
     ftxui::component
@@ -60,7 +62,12 @@ add_executable(ntfs_tests
     src/ntfs_indexer.h
     src/ntfs_structs.h
 )
-target_link_libraries(ntfs_tests PRIVATE fmt::fmt Catch2::Catch2WithMain)
+target_link_libraries(ntfs_tests PRIVATE
+    fmt::fmt
+    Catch2::Catch2WithMain
+    absl::log
+    absl::log_initialize
+)
 if(MSVC)
     target_compile_options(ntfs_tests PRIVATE /W4)
 else()
