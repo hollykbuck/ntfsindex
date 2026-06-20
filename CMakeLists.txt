@@ -4,8 +4,14 @@ project(ntfsindex LANGUAGES CXX VERSION 1.0)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(WIN32)
+    add_compile_definitions(_WIN32_WINNT=0x0A00)
+endif()
+
 # Find dependencies managed by Conan
 find_package(fmt REQUIRED)
+find_package(Boost REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 # Executable definition
 add_executable(ntfsindex
@@ -15,10 +21,12 @@ add_executable(ntfsindex
     src/ntfs_indexer.cpp
     src/ntfs_indexer.h
     src/ntfs_structs.h
+    src/http_server.cpp
+    src/http_server.h
 )
 
 # Link dependencies
-target_link_libraries(ntfsindex PRIVATE fmt::fmt)
+target_link_libraries(ntfsindex PRIVATE fmt::fmt boost::boost nlohmann_json::nlohmann_json)
 
 # Enable compiler warnings
 if(MSVC)

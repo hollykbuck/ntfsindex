@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NTFS Indexer | 前后端分离高速索引检索系统</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar or Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="logo-icon">
+                    <svg viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                        <polyline points="2 17 12 22 22 17"></polyline>
+                        <polyline points="2 12 12 17 22 12"></polyline>
+                    </svg>
+                </div>
+                <div class="brand-text">
+                    <h1>NTFS Indexer</h1>
+                    <span class="subtext">Engine v1.0 • Powered by Boost.Beast</span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <div class="device-badge">
+                    <span class="dot pulse"></span>
+                    <span id="header-device-path">加载中...</span>
+                </div>
+                <button id="btn-update-index" class="btn btn-primary">
+                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="23 4 23 10 17 10"></polyline>
+                        <polyline points="1 20 1 14 7 14"></polyline>
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                    </svg>
+                    <span>增量更新索引</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- Stats Overview Cards -->
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon icon-blue">
+                    <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <span class="stat-label">总文件夹数</span>
+                    <h3 id="stat-dirs" class="stat-value">-</h3>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon icon-cyan">
+                    <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <span class="stat-label">总文件数</span>
+                    <h3 id="stat-files" class="stat-value">-</h3>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon icon-purple">
+                    <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="21" y1="10" x2="3" y2="10"></line>
+                        <line x1="21" y1="6" x2="3" y2="6"></line>
+                        <line x1="21" y1="14" x2="3" y2="14"></line>
+                        <line x1="21" y1="18" x2="3" y2="18"></line>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <span class="stat-label">逻辑总大小</span>
+                    <h3 id="stat-size" class="stat-value">-</h3>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon icon-orange">
+                    <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <span class="stat-label">最新日志位置 (USN)</span>
+                    <h3 id="stat-usn" class="stat-value">-</h3>
+                </div>
+            </div>
+        </section>
+
+        <!-- Main Content Area -->
+        <main class="main-panel">
+            <div class="tab-header">
+                <button class="tab-link active" data-tab="tab-search">
+                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    <span>高速文件搜索</span>
+                </button>
+                <button class="tab-link" data-tab="tab-usn">
+                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 20h9"></path>
+                        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                    </svg>
+                    <span>USN 变更日志 Stream</span>
+                </button>
+            </div>
+
+            <!-- Tab: Search -->
+            <div id="tab-search" class="tab-content active">
+                <div class="search-bar-container">
+                    <div class="search-input-wrapper">
+                        <svg class="search-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                        </svg>
+                        <input type="text" id="search-input" placeholder="输入文件名或路径以快速检索..." autocomplete="off">
+                        <button id="btn-clear-search" class="clear-icon" style="display: none;">
+                            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="search-options">
+                        <div class="select-wrapper">
+                            <label for="limit-select">限制行数: </label>
+                            <select id="limit-select">
+                                <option value="50">50 行</option>
+                                <option value="100" selected>100 行</option>
+                                <option value="500">500 行</option>
+                                <option value="1000">1000 行</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="results-meta">
+                    <div id="results-count" class="meta-info">请输入搜索关键词进行搜索</div>
+                    <div id="search-time" class="meta-info"></div>
+                </div>
+
+                <div class="table-container">
+                    <table id="search-results-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 60%">完整路径</th>
+                                <th style="width: 12%">类型</th>
+                                <th style="width: 16%">大小</th>
+                                <th style="width: 12%; text-align: right;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="search-results-body">
+                            <tr>
+                                <td colspan="4" class="table-placeholder">
+                                    <div class="placeholder-content">
+                                        <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                                            <circle cx="11" cy="11" r="8"></circle>
+                                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                                        </svg>
+                                        <p>在上方搜索框内输入任意字符，可在毫秒级获得海量 NTFS 节点结果。</p>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Tab: USN Change Journal -->
+            <div id="tab-usn" class="tab-content">
+                <div class="results-meta">
+                    <div id="usn-count" class="meta-info">正在读取 USN 变更日志数据...</div>
+                    <button id="btn-refresh-usn" class="btn btn-secondary btn-sm">
+                        <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <polyline points="1 20 1 14 7 14"></polyline>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                        </svg>
+                        <span>刷新日志</span>
+                    </button>
+                </div>
+
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th style="width: 15%">USN 编号</th>
+                                <th style="width: 10%">节点 ID</th>
+                                <th style="width: 20%">事件时间 (UTC)</th>
+                                <th style="width: 25%">变更原因</th>
+                                <th style="width: 30%">文件名</th>
+                            </tr>
+                        </thead>
+                        <tbody id="usn-results-body">
+                            <tr>
+                                <td colspan="5" class="table-placeholder">暂无 USN 日志记录。</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Notification Toast -->
+    <div id="toast-container" class="toast-container"></div>
+</body>
+</html>
