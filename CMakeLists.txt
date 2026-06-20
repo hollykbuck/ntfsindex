@@ -13,6 +13,7 @@ find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(absl REQUIRED)
+find_package(ftxui REQUIRED)
 
 # Executable definition
 add_executable(ntfsindex
@@ -24,10 +25,21 @@ add_executable(ntfsindex
     src/ntfs_structs.h
     src/http_server.cpp
     src/http_server.h
+    src/tui_client.cpp
+    src/tui_client.h
 )
 
 # Link dependencies
-target_link_libraries(ntfsindex PRIVATE fmt::fmt boost::boost nlohmann_json::nlohmann_json absl::flags absl::flags_parse)
+target_link_libraries(ntfsindex PRIVATE
+    fmt::fmt
+    boost::boost
+    nlohmann_json::nlohmann_json
+    absl::flags
+    absl::flags_parse
+    ftxui::screen
+    ftxui::dom
+    ftxui::component
+)
 
 # Enable compiler warnings
 if(MSVC)

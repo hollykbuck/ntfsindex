@@ -11,6 +11,7 @@
 #include "ntfs_parser.h"
 #include "ntfs_indexer.h"
 #include "http_server.h"
+#include "tui_client.h"
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/flags/usage.h"
@@ -110,6 +111,7 @@ ABSL_FLAG(uint16_t, port, 0, "Port for the HTTP API server (e.g. 8080)");
 ABSL_FLAG(std::string, address, "", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
 ABSL_FLAG(std::string, doc_root, "", "Document root directory serving frontend assets");
 ABSL_FLAG(std::string, config, "config.json", "Path to config.json file containing default options");
+ABSL_FLAG(bool, tui, false, "Start in interactive TUI mode instead of HTTP Server");
 
 int main(int argc, char* argv[]) {
     // Initialize Abseil Program Usage and Parse CommandLine
@@ -177,9 +179,14 @@ int main(int argc, char* argv[]) {
 
     indexer.print_stats(config.device_path);
 
-    HttpServer server(parser, indexer, config.address, config.port, config.doc_root, config.device_path);
-    if (!server.run()) {
-        return 1;
+    if (absl::GetFlag(FLAGS_tui)) {
+        TuiClient tui(parser, indexer);
+        tui.run();
+    } else {
+        HttpServer server(parser, indexer, config.address, config.port, config.doc_root, config.device_path);
+        if (!server.run()) {
+            return 1;
+        }
     }
 
     return 0;
