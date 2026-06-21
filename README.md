@@ -25,7 +25,7 @@ The project dependencies are managed by **Conan 2** and built with **CMake (>= 3
 The server can be configured in three ways (ordered by increasing priority):
 1. **Defaults**: Hardcoded fallbacks (`$MFT`, `8080`, `0.0.0.0`, `./web`).
 2. **Configuration File**: Settings loaded from a flag file using Abseil's native `--flagfile` parameter.
-3. **Command-line Arguments & Flags**: Override settings via positional arguments or explicit Abseil flags.
+3. **Command-line Flags**: Override settings via explicit Abseil flags.
 
 ### Configuration File (`flags.txt`)
 Instead of long command-line options, you can use Abseil's built-in flagfile mechanism.
@@ -52,11 +52,6 @@ build\Debug\ntfsindex.exe --device_path \\.\C: --port 9000 --address 127.0.0.1 -
 **Option C: Using a flag file** (loads flags from a file):
 ```bash
 build\Debug\ntfsindex.exe --flagfile=flags.txt
-```
-
-**Option D: Using legacy positional arguments**:
-```bash
-build\Debug\ntfsindex.exe \\.\C: 8080 .\web
 ```
 
 To view all available command-line configuration options, run the executable with `--helpfull`:

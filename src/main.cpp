@@ -133,8 +133,8 @@ ABSL_FLAG(bool, tui, false, "Start in interactive TUI mode instead of HTTP Serve
 
 int main(int argc, char* argv[]) {
     // Initialize Abseil Program Usage and Parse CommandLine
-    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using flags, standard flagfile (e.g. --flagfile=flags.txt), or legacy positional arguments.");
-    auto positional_args = absl::ParseCommandLine(argc, argv);
+    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using flags or standard flagfile (e.g. --flagfile=flags.txt).");
+    absl::ParseCommandLine(argc, argv);
 
     // Initialize Abseil Logging
     absl::InitializeLog();
@@ -151,26 +151,12 @@ int main(int argc, char* argv[]) {
         absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
     }
 
-    // 1. Load config options from Abseil flags
+    // Load config options from Abseil flags
     AppConfig config;
     config.device_path = absl::GetFlag(FLAGS_device_path);
     config.port = absl::GetFlag(FLAGS_port);
     config.address = absl::GetFlag(FLAGS_address);
     config.doc_root = absl::GetFlag(FLAGS_doc_root);
-
-    // 2. Override with legacy positional arguments if provided
-    // Usage: prog_name <device_path> [port] [doc_root]
-    if (positional_args.size() >= 2) {
-        config.device_path = positional_args[1];
-    }
-    if (positional_args.size() >= 3) {
-        try {
-            config.port = static_cast<uint16_t>(std::stoul(positional_args[2]));
-        } catch (...) {}
-    }
-    if (positional_args.size() >= 4) {
-        config.doc_root = positional_args[3];
-    }
 
     LOG(INFO) << "---------------------------------------------";
     LOG(INFO) << "[Server Config Options]";
