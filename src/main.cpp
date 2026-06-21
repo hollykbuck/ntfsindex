@@ -6,11 +6,9 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
-#include <chrono>
 #include <ctime>
 #include <fstream>
 #include <fmt/format.h>
-#include <nlohmann/json.hpp>
 #include "ntfs_parser.h"
 #include "ntfs_indexer.h"
 #include "http_server.h"
@@ -124,48 +122,18 @@ struct AppConfig {
     std::string doc_root = "./web";
 };
 
-AppConfig load_config(const std::string& path) {
-    AppConfig config;
-    std::ifstream f(path);
-    if (!f.is_open()) {
-        LOG(INFO) << "[Config] Configuration file not found or couldn't be opened: " << path << ". Using defaults.";
-        return config;
-    }
-    try {
-        nlohmann::json j;
-        f >> j;
-        if (j.contains("device_path") && j["device_path"].is_string()) {
-            config.device_path = j["device_path"].get<std::string>();
-        }
-        if (j.contains("port") && j["port"].is_number_integer()) {
-            config.port = j["port"].get<uint16_t>();
-        }
-        if (j.contains("address") && j["address"].is_string()) {
-            config.address = j["address"].get<std::string>();
-        }
-        if (j.contains("doc_root") && j["doc_root"].is_string()) {
-            config.doc_root = j["doc_root"].get<std::string>();
-        }
-        LOG(INFO) << "[Config] Loaded configuration from: " << path;
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "[Config] Error parsing " << path << ": " << e.what() << ". Using defaults.";
-    }
-    return config;
-}
-
 } // namespace
 
 // Define Abseil command line flags
-ABSL_FLAG(std::string, device_path, "", "Path to raw MFT file or partition (e.g. \\\\.\\C: or $MFT)");
-ABSL_FLAG(uint16_t, port, 0, "Port for the HTTP API server (e.g. 8080)");
-ABSL_FLAG(std::string, address, "", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
-ABSL_FLAG(std::string, doc_root, "", "Document root directory serving frontend assets");
-ABSL_FLAG(std::string, config, "config.json", "Path to config.json file containing default options");
+ABSL_FLAG(std::string, device_path, "$MFT", "Path to raw MFT file or partition (e.g. \\\\.\\C: or $MFT)");
+ABSL_FLAG(uint16_t, port, 8080, "Port for the HTTP API server (e.g. 8080)");
+ABSL_FLAG(std::string, address, "0.0.0.0", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
+ABSL_FLAG(std::string, doc_root, "./web", "Document root directory serving frontend assets");
 ABSL_FLAG(bool, tui, false, "Start in interactive TUI mode instead of HTTP Server");
 
 int main(int argc, char* argv[]) {
     // Initialize Abseil Program Usage and Parse CommandLine
-    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using config.json, arguments, or flags.");
+    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using flags, standard flagfile (e.g. --flagfile=flags.txt), or legacy positional arguments.");
     auto positional_args = absl::ParseCommandLine(argc, argv);
 
     // Initialize Abseil Logging
@@ -183,9 +151,12 @@ int main(int argc, char* argv[]) {
         absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
     }
 
-    // 1. Load config file
-    std::string config_path = absl::GetFlag(FLAGS_config);
-    AppConfig config = load_config(config_path);
+    // 1. Load config options from Abseil flags
+    AppConfig config;
+    config.device_path = absl::GetFlag(FLAGS_device_path);
+    config.port = absl::GetFlag(FLAGS_port);
+    config.address = absl::GetFlag(FLAGS_address);
+    config.doc_root = absl::GetFlag(FLAGS_doc_root);
 
     // 2. Override with legacy positional arguments if provided
     // Usage: prog_name <device_path> [port] [doc_root]
@@ -199,20 +170,6 @@ int main(int argc, char* argv[]) {
     }
     if (positional_args.size() >= 4) {
         config.doc_root = positional_args[3];
-    }
-
-    // 3. Override with explicit Abseil flags if specified on CLI
-    if (!absl::GetFlag(FLAGS_device_path).empty()) {
-        config.device_path = absl::GetFlag(FLAGS_device_path);
-    }
-    if (absl::GetFlag(FLAGS_port) != 0) {
-        config.port = absl::GetFlag(FLAGS_port);
-    }
-    if (!absl::GetFlag(FLAGS_address).empty()) {
-        config.address = absl::GetFlag(FLAGS_address);
-    }
-    if (!absl::GetFlag(FLAGS_doc_root).empty()) {
-        config.doc_root = absl::GetFlag(FLAGS_doc_root);
     }
 
     LOG(INFO) << "---------------------------------------------";

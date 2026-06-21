@@ -20,28 +20,26 @@ The project dependencies are managed by **Conan 2** and built with **CMake (>= 3
    ```bash
    cmake --build --preset conan-debug
    ```
-
 ## Running the Server
 
 The server can be configured in three ways (ordered by increasing priority):
 1. **Defaults**: Hardcoded fallbacks (`$MFT`, `8080`, `0.0.0.0`, `./web`).
-2. **Configuration File**: Settings loaded from `config.json` (or custom path via `--config`).
+2. **Configuration File**: Settings loaded from a flag file using Abseil's native `--flagfile` parameter.
 3. **Command-line Arguments & Flags**: Override settings via positional arguments or explicit Abseil flags.
 
-### Configuration File (`config.json`)
-A default `config.json` is located in the root directory:
-```json
-{
-  "device_path": "$MFT",
-  "port": 8080,
-  "address": "0.0.0.0",
-  "doc_root": "./web"
-}
+### Configuration File (`flags.txt`)
+Instead of long command-line options, you can use Abseil's built-in flagfile mechanism.
+Create a file, e.g., `flags.txt`:
+```txt
+--device_path=$MFT
+--port=8080
+--address=0.0.0.0
+--doc_root=./web
 ```
 
 ### Starting the Server
 
-**Option A: Using `config.json` defaults** (reads options from `config.json` next to execution path):
+**Option A: Using defaults** (reads options directly from flag definitions):
 ```bash
 build\Debug\ntfsindex.exe
 ```
@@ -51,7 +49,12 @@ build\Debug\ntfsindex.exe
 build\Debug\ntfsindex.exe --device_path \\.\C: --port 9000 --address 127.0.0.1 --doc_root .\web
 ```
 
-**Option C: Using legacy positional arguments**:
+**Option C: Using a flag file** (loads flags from a file):
+```bash
+build\Debug\ntfsindex.exe --flagfile=flags.txt
+```
+
+**Option D: Using legacy positional arguments**:
 ```bash
 build\Debug\ntfsindex.exe \\.\C: 8080 .\web
 ```
