@@ -4,6 +4,7 @@
 #include <stdexec/execution.hpp>
 #include <exec/single_thread_context.hpp>
 #include <exec/asio/asio_thread_pool.hpp>
+#include <exec/async_scope.hpp>
 #include <utility>
 
 class NtfsParser;
@@ -32,5 +33,7 @@ private:
     unsigned short port_;
     std::string doc_root_;
     std::string dev_path_;
+    
+    exec::async_scope scope_;
 };
 

@@ -547,7 +547,8 @@ handle_request(
 
 // Handles an HTTP server connection
 void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer,
-                HttpServer::WorkerSchedulerType worker_scheduler, HttpServer::IoSchedulerType io_scheduler, std::string dev_path) {
+                HttpServer::WorkerSchedulerType worker_scheduler, HttpServer::IoSchedulerType io_scheduler,
+                exec::async_scope& scope, std::string dev_path) {
     struct Session {
         tcp::socket socket;
         beast::flat_buffer buffer;
@@ -557,7 +558,7 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
     auto s = std::make_shared<Session>(Session{std::move(socket), {}, {}});
     
     auto run_cycle = std::make_shared<std::function<void()>>();
-    *run_cycle = [s, doc_root, &parser, &indexer, worker_scheduler, io_scheduler, dev_path, run_cycle]() {
+    *run_cycle = [s, doc_root, &parser, &indexer, worker_scheduler, io_scheduler, &scope, dev_path, run_cycle]() {
         auto read_sender = http::async_read(s->socket, s->buffer, s->req, exec::asio::use_sender);
         
         auto pipeline = std::move(read_sender)
@@ -594,7 +595,7 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
                 s->socket.shutdown(tcp::socket::shutdown_both, ec);
             });
 
-        exec::start_detached(std::move(pipeline));
+        scope.spawn(std::move(pipeline));
     };
 
     (*run_cycle)();
@@ -605,7 +606,9 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
 HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, WorkerSchedulerType worker_scheduler, IoSchedulerType io_scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path)
     : parser_(parser), indexer_(indexer), worker_scheduler_(worker_scheduler), io_scheduler_(io_scheduler), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path) {}
 
-HttpServer::~HttpServer() = default;
+HttpServer::~HttpServer() {
+    stdexec::sync_wait(scope_.on_empty());
+}
 
 bool HttpServer::run() {
     try {
@@ -627,10 +630,11 @@ bool HttpServer::run() {
                         indexer_,
                         worker_scheduler_,
                         io_scheduler_,
+                        scope_,
                         dev_path_
                     );
                 });
-            exec::start_detached(std::move(session_sender));
+            scope_.spawn(std::move(session_sender));
         }
     } catch (const std::exception& e) {
         LOG(ERROR) << "[HTTP Server] Error: " << e.what();
@@ -640,6 +644,5 @@ bool HttpServer::run() {
 }
 
 void HttpServer::stop() {
-    // Synchronous Beast acceptor loop is running, stopping it cleanly would require calling acceptor.close()
-    // or stopping ioc. For this command line backend tool, running until termination is fine.
+    stdexec::sync_wait(scope_.on_empty());
 }

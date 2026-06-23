@@ -29,6 +29,7 @@
 #include <exec/single_thread_context.hpp>
 #include <exec/asio/asio_thread_pool.hpp>
 #include <exec/asio/use_sender.hpp>
+#include <exec/async_scope.hpp>
 #include <utility>
 
 #include <boost/beast/http.hpp>
