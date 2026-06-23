@@ -54,6 +54,18 @@ build\Debug\ntfsindex.exe --device_path \\.\C: --port 9000 --address 127.0.0.1 -
 build\Debug\ntfsindex.exe --flagfile=flags.txt
 ```
 
+### File Logging
+
+Set `NTFSINDEX_LOG_FILE` to append Abseil logs to a file. You can also set
+`NTFSINDEX_LOG_LEVEL` to filter file logs. Supported values are `INFO`,
+`WARNING`/`WARN`, `ERROR`, `FATAL`, and `OFF`.
+
+```powershell
+$env:NTFSINDEX_LOG_FILE = "out.log"
+$env:NTFSINDEX_LOG_LEVEL = "WARNING"
+build\Debug\ntfsindex.exe --tui
+```
+
 To view all available command-line configuration options, run the executable with `--helpfull`:
 ```bash
 build\Debug\ntfsindex.exe --helpfull

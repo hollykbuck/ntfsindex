@@ -43,7 +43,8 @@ namespace {
 
 class FileLogSink : public absl::LogSink {
  public:
-  explicit FileLogSink(const std::string& filename) : file_(filename, std::ios::app) {}
+  FileLogSink(const std::string& filename, absl::LogSeverityAtLeast min_severity)
+      : file_(filename, std::ios::app), min_severity_(min_severity) {}
   ~FileLogSink() override {
       std::lock_guard<std::mutex> lock(mutex_);
       if (file_.is_open()) {
@@ -52,6 +53,10 @@ class FileLogSink : public absl::LogSink {
   }
 
   void Send(const absl::LogEntry& entry) override {
+    if (!should_log(entry.log_severity())) {
+      return;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (file_.is_open()) {
       file_ << entry.text_message_with_prefix_and_newline();
@@ -60,14 +65,31 @@ class FileLogSink : public absl::LogSink {
   }
 
  private:
+  bool should_log(absl::LogSeverity severity) const {
+    switch (min_severity_) {
+      case absl::LogSeverityAtLeast::kInfo:
+        return severity >= absl::LogSeverity::kInfo;
+      case absl::LogSeverityAtLeast::kWarning:
+        return severity >= absl::LogSeverity::kWarning;
+      case absl::LogSeverityAtLeast::kError:
+        return severity >= absl::LogSeverity::kError;
+      case absl::LogSeverityAtLeast::kFatal:
+        return severity >= absl::LogSeverity::kFatal;
+      case absl::LogSeverityAtLeast::kInfinity:
+        return false;
+    }
+    return true;
+  }
+
   std::ofstream file_;
   std::mutex mutex_;
+  absl::LogSeverityAtLeast min_severity_;
 };
 
 class ScopedFileLogger {
 public:
-    explicit ScopedFileLogger(const std::string& filename) {
-        sink_ = std::make_unique<FileLogSink>(filename);
+    ScopedFileLogger(const std::string& filename, absl::LogSeverityAtLeast min_severity) {
+        sink_ = std::make_unique<FileLogSink>(filename, min_severity);
         absl::AddLogSink(sink_.get());
     }
     ~ScopedFileLogger() {
@@ -78,6 +100,37 @@ public:
 private:
     std::unique_ptr<FileLogSink> sink_;
 };
+
+absl::LogSeverityAtLeast parse_log_level_env(const char* value) {
+    if (!value || value[0] == '\0') {
+        return absl::LogSeverityAtLeast::kInfo;
+    }
+
+    std::string level = value;
+    std::transform(level.begin(), level.end(), level.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    if (level == "info") {
+        return absl::LogSeverityAtLeast::kInfo;
+    }
+    if (level == "warning" || level == "warn") {
+        return absl::LogSeverityAtLeast::kWarning;
+    }
+    if (level == "error" || level == "err") {
+        return absl::LogSeverityAtLeast::kError;
+    }
+    if (level == "fatal") {
+        return absl::LogSeverityAtLeast::kFatal;
+    }
+    if (level == "off" || level == "none" || level == "disabled") {
+        return absl::LogSeverityAtLeast::kInfinity;
+    }
+
+    LOG(WARNING) << fmt::format(
+        "Invalid NTFSINDEX_LOG_LEVEL '{}'. Supported values: INFO, WARNING, ERROR, FATAL, OFF. Falling back to INFO.",
+        value);
+    return absl::LogSeverityAtLeast::kInfo;
+}
 
 std::string to_lowercase(const std::string& str) {
     std::string lower = str;
@@ -160,7 +213,9 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<ScopedFileLogger> file_logger;
     const char* log_file_env = std::getenv("NTFSINDEX_LOG_FILE");
     if (log_file_env && log_file_env[0] != '\0') {
-        file_logger = std::make_unique<ScopedFileLogger>(log_file_env);
+        file_logger = std::make_unique<ScopedFileLogger>(
+            log_file_env,
+            parse_log_level_env(std::getenv("NTFSINDEX_LOG_LEVEL")));
     }
 
     // Silence stderr logging in TUI mode to avoid terminal corruption
