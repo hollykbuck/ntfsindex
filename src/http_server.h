@@ -7,6 +7,10 @@
 #include <exec/asio/asio_thread_pool.hpp>
 #include <exec/async_scope.hpp>
 #include <utility>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 class NtfsParser;
 class NtfsIndexer;
@@ -16,7 +20,7 @@ public:
     using WorkerSchedulerType = decltype(std::declval<exec::single_thread_context>().get_scheduler());
     using IoSchedulerType = decltype(std::declval<exec::asio::asio_thread_pool>().get_scheduler());
 
-    HttpServer(NtfsParser& parser, NtfsIndexer& indexer, WorkerSchedulerType worker_scheduler, IoSchedulerType io_scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path);
+    HttpServer(NtfsParser& parser, NtfsIndexer& indexer, WorkerSchedulerType worker_scheduler, IoSchedulerType io_scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path, uint32_t auto_update_interval = 0);
     ~HttpServer();
 
     // Start the server (blocks until stopped or error occurs)
@@ -36,6 +40,12 @@ private:
     std::string dev_path_;
     
     exec::async_scope scope_;
+
+    uint32_t auto_update_interval_ = 0;
+    std::thread auto_update_thread_;
+    std::atomic<bool> stop_auto_update_{false};
+    std::mutex auto_update_mutex_;
+    std::condition_variable auto_update_cv_;
 };
 
 struct HttpContext {

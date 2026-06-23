@@ -10,6 +10,7 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <stdexec/execution.hpp>
 #include <exec/single_thread_context.hpp>
 #include <exec/async_scope.hpp>
@@ -67,7 +68,7 @@ TuiClient::TuiClient(NtfsParser& parser, NtfsIndexer& indexer, const std::string
 void TuiClient::run() {
     LOG(INFO) << "TuiClient::run() entered.";
     auto screen = ScreenInteractive::Fullscreen();
-    screen.TrackMouse(false);
+    // screen.TrackMouse(false);
 
     std::string search_query = "";
     std::vector<const FileEntry*> filtered_files;
@@ -75,6 +76,12 @@ void TuiClient::run() {
     int selected_index = 0;
 
     std::mutex search_mutex;
+    std::mutex auto_update_mutex;
+    std::condition_variable auto_update_cv;
+    std::atomic<bool> stop_auto_update{false};
+    int auto_update_interval = 0;
+    std::vector<std::string> auto_update_options = {"Off", "5s", "30s", "60s"};
+    int auto_update_option_index = 0;
     
     std::vector<const FileEntry*> bg_filtered_files;
     std::vector<std::string> bg_file_names;
@@ -287,13 +294,33 @@ void TuiClient::run() {
         return handled;
     });
 
+    Component raw_auto_update_toggle = Toggle(&auto_update_options, &auto_update_option_index);
+    Component auto_update_toggle = raw_auto_update_toggle | CatchEvent([raw_auto_update_toggle, &auto_update_option_index, &auto_update_interval, &auto_update_mutex, &auto_update_cv](Event event) {
+        int old_val = auto_update_option_index;
+        bool handled = raw_auto_update_toggle->OnEvent(event);
+        if (auto_update_option_index != old_val) {
+            int new_val = 0;
+            if (auto_update_option_index == 1) new_val = 5;
+            else if (auto_update_option_index == 2) new_val = 30;
+            else if (auto_update_option_index == 3) new_val = 60;
+            
+            {
+                std::lock_guard<std::mutex> lock(auto_update_mutex);
+                auto_update_interval = new_val;
+            }
+            auto_update_cv.notify_all();
+        }
+        return handled;
+    });
+
     Component file_list = Menu(&file_names, &selected_index);
 
     auto search_panel = Container::Vertical({
         input_field,
         Container::Horizontal({
             regex_checkbox,
-            type_toggle
+            type_toggle,
+            auto_update_toggle
         }),
         file_list
     });
@@ -402,7 +429,10 @@ void TuiClient::run() {
                     regex_checkbox->Render(),
                     text(" | ") | dim,
                     text("Filter: ") | dim,
-                    type_toggle->Render()
+                    type_toggle->Render(),
+                    text(" | ") | dim,
+                    text("Auto Update: ") | bold | color(Color::Cyan),
+                    auto_update_toggle->Render()
                 }),
                 separator(),
                 
@@ -638,12 +668,78 @@ void TuiClient::run() {
             screen.PostEvent(Event::Custom);
         });
 
+    std::thread auto_update_thread;
+    auto_update_thread = std::thread([&]() {
+        LOG(INFO) << "[TUI Auto Update] Background auto-update thread started.";
+        while (!stop_auto_update.load()) {
+            int interval = 0;
+            {
+                std::lock_guard<std::mutex> lock(auto_update_mutex);
+                interval = auto_update_interval;
+            }
+
+            if (interval <= 0) {
+                std::unique_lock<std::mutex> lock(auto_update_mutex);
+                auto_update_cv.wait(lock, [&]() {
+                    return stop_auto_update.load() || auto_update_interval > 0;
+                });
+                continue;
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(auto_update_mutex);
+                if (auto_update_cv.wait_for(lock, std::chrono::seconds(interval), [&]() {
+                    return stop_auto_update.load() || auto_update_interval != interval;
+                })) {
+                    // Woke up due to stop or interval change, re-evaluate
+                    continue;
+                }
+            }
+
+            // Dispatch update task to search scheduler to ensure serialization and safety
+            auto update_sender = stdexec::schedule(search_scheduler)
+                | stdexec::then([&]() {
+                    LOG(INFO) << "[TUI Auto Update] Triggering scheduled incremental update...";
+                    bool success = indexer_.update_index_incremental(parser_);
+                    if (success) {
+                        std::vector<const FileEntry*> temp_all_files;
+                        temp_all_files.reserve(indexer_.get_files().size());
+                        for (const auto& [id, entry] : indexer_.get_files()) {
+                            temp_all_files.push_back(&entry);
+                        }
+                        std::sort(temp_all_files.begin(), temp_all_files.end(), [](const FileEntry* a, const FileEntry* b) {
+                            return a->full_path < b->full_path;
+                        });
+
+                        {
+                            std::lock_guard<std::mutex> lock(search_mutex);
+                            all_files = std::move(temp_all_files);
+                        }
+
+                        // Re-trigger search to update view
+                        trigger_search();
+                    }
+                });
+            stdexec::sync_wait(std::move(update_sender));
+        }
+        LOG(INFO) << "[TUI Auto Update] Background auto-update thread stopped.";
+    });
+
     LOG(INFO) << "TuiClient: Spawning scan_sender task.";
     scan_scope.spawn(std::move(scan_sender));
 
     LOG(INFO) << "TuiClient: Entering screen.Loop().";
     screen.Loop(catch_exit);
-    LOG(INFO) << "TuiClient: screen.Loop() returned. Waiting for scopes to clear.";
+    LOG(INFO) << "TuiClient: screen.Loop() returned. Stopping auto-update thread...";
+
+    {
+        std::lock_guard<std::mutex> lock(auto_update_mutex);
+        stop_auto_update = true;
+    }
+    auto_update_cv.notify_all();
+    if (auto_update_thread.joinable()) {
+        auto_update_thread.join();
+    }
 
     stdexec::sync_wait(scope.on_empty());
     LOG(INFO) << "TuiClient: scope cleared.";

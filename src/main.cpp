@@ -133,6 +133,7 @@ struct AppConfig {
     uint16_t port = 8080;
     std::string address = "0.0.0.0";
     std::string doc_root = "./web";
+    uint32_t auto_update_interval = 0;
 };
 
 } // namespace
@@ -143,6 +144,7 @@ ABSL_FLAG(uint16_t, port, 8080, "Port for the HTTP API server (e.g. 8080)");
 ABSL_FLAG(std::string, address, "0.0.0.0", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
 ABSL_FLAG(std::string, doc_root, "./web", "Document root directory serving frontend assets");
 ABSL_FLAG(bool, tui, false, "Start in interactive TUI mode instead of HTTP Server");
+ABSL_FLAG(uint32_t, auto_update_interval, 0, "Interval in seconds for automatic incremental updates (0 to disable)");
 
 int main(int argc, char* argv[]) {
     // Initialize Abseil Program Usage and Parse CommandLine
@@ -170,6 +172,7 @@ int main(int argc, char* argv[]) {
     config.port = absl::GetFlag(FLAGS_port);
     config.address = absl::GetFlag(FLAGS_address);
     config.doc_root = absl::GetFlag(FLAGS_doc_root);
+    config.auto_update_interval = absl::GetFlag(FLAGS_auto_update_interval);
 
     LOG(INFO) << "---------------------------------------------";
     LOG(INFO) << "[Server Config Options]";
@@ -177,6 +180,7 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << fmt::format("  - Listen Address:  {}", config.address);
     LOG(INFO) << fmt::format("  - Listen Port:     {}", config.port);
     LOG(INFO) << fmt::format("  - Frontend Root:   {}", config.doc_root);
+    LOG(INFO) << fmt::format("  - Auto Update:     {}s", config.auto_update_interval == 0 ? "Disabled" : std::to_string(config.auto_update_interval));
     LOG(INFO) << "---------------------------------------------";
 
     exec::single_thread_context worker_ctx;
@@ -222,7 +226,7 @@ int main(int argc, char* argv[]) {
 
         indexer.print_stats(config.device_path);
 
-        HttpServer server(parser, indexer, scheduler, io_scheduler, config.address, config.port, config.doc_root, config.device_path);
+        HttpServer server(parser, indexer, scheduler, io_scheduler, config.address, config.port, config.doc_root, config.device_path, config.auto_update_interval);
         if (!server.run()) {
             return 1;
         }

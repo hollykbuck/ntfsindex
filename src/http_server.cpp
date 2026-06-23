@@ -639,10 +639,48 @@ void do_session(tcp::socket socket, const HttpContext& ctx, exec::async_scope& s
 
 } // namespace
 
-HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, WorkerSchedulerType worker_scheduler, IoSchedulerType io_scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path)
-    : parser_(parser), indexer_(indexer), worker_scheduler_(worker_scheduler), io_scheduler_(io_scheduler), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path) {}
+HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, WorkerSchedulerType worker_scheduler, IoSchedulerType io_scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path, uint32_t auto_update_interval)
+    : parser_(parser), indexer_(indexer), worker_scheduler_(worker_scheduler), io_scheduler_(io_scheduler), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path), auto_update_interval_(auto_update_interval) {
+    if (auto_update_interval_ > 0) {
+        stop_auto_update_ = false;
+        auto_update_thread_ = std::thread([this]() {
+            LOG(INFO) << fmt::format("[Auto Update] Started background auto-update thread with interval: {} seconds", auto_update_interval_);
+            while (!stop_auto_update_) {
+                std::unique_lock<std::mutex> lock(auto_update_mutex_);
+                if (auto_update_cv_.wait_for(lock, std::chrono::seconds(auto_update_interval_), [this]() { return stop_auto_update_.load(); })) {
+                    break;
+                }
+                
+                // Dispatch the update task to the worker scheduler and wait for it to complete
+                auto update_sender = stdexec::schedule(worker_scheduler_)
+                    | stdexec::then([this]() {
+                        LOG(INFO) << "[Auto Update] Triggering scheduled incremental update...";
+                        auto start_time = std::chrono::high_resolution_clock::now();
+                        bool success = indexer_.update_index_incremental(parser_);
+                        auto end_time = std::chrono::high_resolution_clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                        if (success) {
+                            LOG(INFO) << fmt::format("[Auto Update] Scheduled incremental update succeeded in {} ms.", elapsed.count());
+                        } else {
+                            LOG(ERROR) << "[Auto Update] Scheduled incremental update failed.";
+                        }
+                    });
+                stdexec::sync_wait(std::move(update_sender));
+            }
+            LOG(INFO) << "[Auto Update] Background auto-update thread stopped.";
+        });
+    }
+}
 
 HttpServer::~HttpServer() {
+    if (auto_update_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(auto_update_mutex_);
+            stop_auto_update_ = true;
+        }
+        auto_update_cv_.notify_all();
+        auto_update_thread_.join();
+    }
     stdexec::sync_wait(scope_.on_empty());
 }
 
