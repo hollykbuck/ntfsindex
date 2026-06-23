@@ -2,7 +2,9 @@
 #include <iostream>
 #include "absl/log/log.h"
 #include <chrono>
-#include <unordered_map>
+#include "absl/container/node_hash_map.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include <algorithm>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -24,6 +26,25 @@ void from_json(const nlohmann::json& j, FileEntry& e) {
     j.at("name").get_to(e.name);
     j.at("is_directory").get_to(e.is_directory);
     j.at("size").get_to(e.size);
+}
+void to_json(nlohmann::json& j, const absl::node_hash_map<uint64_t, FileEntry>& m) {
+    j = nlohmann::json::array();
+    for (const auto& [id, entry] : m) {
+        j.push_back({id, entry});
+    }
+}
+
+void from_json(const nlohmann::json& j, absl::node_hash_map<uint64_t, FileEntry>& m) {
+    m.clear();
+    if (j.is_array()) {
+        for (const auto& item : j) {
+            m.emplace(item.at(0).get<uint64_t>(), item.at(1).get<FileEntry>());
+        }
+    } else if (j.is_object()) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            m.emplace(std::stoull(it.key()), it.value().get<FileEntry>());
+        }
+    }
 }
 
 namespace {
@@ -127,8 +148,8 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
     size_t added = 0;
     size_t modified = 0;
     size_t deleted = 0;
-    std::unordered_map<uint64_t, std::string> deleted_names;
-    std::unordered_map<uint64_t, std::string> updated_names;
+    absl::flat_hash_map<uint64_t, std::string> deleted_names;
+    absl::flat_hash_map<uint64_t, std::string> updated_names;
 
     for (const auto& entry : entries) {
         if (entry.reason & 0x00000200) { // DELETE
@@ -211,13 +232,12 @@ std::string NtfsIndexer::get_absolute_path(uint64_t id) const {
 
     std::vector<uint64_t> path_ids;
     uint64_t curr = id;
-    std::unordered_map<uint64_t, bool> visited;
+    absl::flat_hash_set<uint64_t> visited;
 
     while (curr != 5 && curr != 0) {
-        if (visited[curr]) {
+        if (!visited.insert(curr).second) {
             break; // Cycle detected
         }
-        visited[curr] = true;
 
         auto it = files_.find(curr);
         if (it == files_.end()) {
@@ -274,13 +294,35 @@ bool NtfsIndexer::save_to_cache(const std::string& cache_path) const {
             LOG(ERROR) << "[Cache] Failed to open cache file for writing: " << cache_path;
             return false;
         }
-        
-        nlohmann::json j;
-        j["last_usn"] = last_usn_;
-        j["files"] = files_;
-        
-        std::vector<uint8_t> msgpack = nlohmann::json::to_msgpack(j);
-        os.write(reinterpret_cast<const char*>(msgpack.data()), msgpack.size());
+
+        // Write Magic: NIDX (little endian)
+        uint32_t magic = 0x5844494E;
+        os.write(reinterpret_cast<const char*>(&magic), 4);
+
+        // Write Version: 1
+        uint32_t version = 1;
+        os.write(reinterpret_cast<const char*>(&version), 4);
+
+        // Write last_usn_
+        os.write(reinterpret_cast<const char*>(&last_usn_), 8);
+
+        // Write size of files_
+        uint64_t num_files = files_.size();
+        os.write(reinterpret_cast<const char*>(&num_files), 8);
+
+        for (const auto& [id, entry] : files_) {
+            os.write(reinterpret_cast<const char*>(&entry.id), 8);
+            os.write(reinterpret_cast<const char*>(&entry.parent_id), 8);
+            uint8_t is_dir = entry.is_directory ? 1 : 0;
+            os.write(reinterpret_cast<const char*>(&is_dir), 1);
+            os.write(reinterpret_cast<const char*>(&entry.size), 8);
+
+            uint32_t name_len = static_cast<uint32_t>(entry.name.size());
+            os.write(reinterpret_cast<const char*>(&name_len), 4);
+            if (name_len > 0) {
+                os.write(entry.name.data(), name_len);
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         LOG(ERROR) << "[Cache] Exception while saving cache: " << e.what();
@@ -293,6 +335,7 @@ bool NtfsIndexer::save_to_cache(const std::string& cache_path) const {
 
 bool NtfsIndexer::load_from_cache(const std::string& cache_path) {
     try {
+        auto t0 = std::chrono::high_resolution_clock::now();
         std::ifstream is(cache_path, std::ios::binary | std::ios::ate);
         if (!is.is_open()) {
             return false;
@@ -306,10 +349,93 @@ bool NtfsIndexer::load_from_cache(const std::string& cache_path) {
             LOG(ERROR) << "[Cache] Failed to read cache file content: " << cache_path;
             return false;
         }
+        auto t1 = std::chrono::high_resolution_clock::now();
         
-        nlohmann::json j = nlohmann::json::from_msgpack(buffer);
-        last_usn_ = j.at("last_usn").get<uint64_t>();
-        files_ = j.at("files").get<std::unordered_map<uint64_t, FileEntry>>();
+        bool use_binary = false;
+        if (size >= 8) {
+            uint32_t magic = *reinterpret_cast<const uint32_t*>(buffer.data());
+            if (magic == 0x5844494E) {
+                use_binary = true;
+            }
+        }
+
+        if (use_binary) {
+            const uint8_t* limit = buffer.data() + size;
+            const uint8_t* ptr = buffer.data() + 4; // skip magic
+
+            if (ptr + 20 > limit) {
+                LOG(ERROR) << "[Cache] Corrupted binary cache header (truncated)";
+                return false;
+            }
+
+            uint32_t version = *reinterpret_cast<const uint32_t*>(ptr);
+            ptr += 4;
+            if (version != 1) {
+                LOG(ERROR) << "[Cache] Unsupported cache version: " << version;
+                return false;
+            }
+
+            last_usn_ = *reinterpret_cast<const uint64_t*>(ptr);
+            ptr += 8;
+
+            uint64_t num_files = *reinterpret_cast<const uint64_t*>(ptr);
+            ptr += 8;
+
+            files_.clear();
+            files_.reserve(num_files);
+
+            for (uint64_t i = 0; i < num_files; ++i) {
+                if (ptr + 29 > limit) {
+                    LOG(ERROR) << "[Cache] Corrupted binary cache record (truncated)";
+                    return false;
+                }
+                uint64_t id = *reinterpret_cast<const uint64_t*>(ptr);
+                ptr += 8;
+
+                uint64_t parent_id = *reinterpret_cast<const uint64_t*>(ptr);
+                ptr += 8;
+
+                uint8_t is_dir = *reinterpret_cast<const uint8_t*>(ptr);
+                ptr += 1;
+
+                uint64_t f_size = *reinterpret_cast<const uint64_t*>(ptr);
+                ptr += 8;
+
+                uint32_t name_len = *reinterpret_cast<const uint32_t*>(ptr);
+                ptr += 4;
+
+                if (ptr + name_len > limit) {
+                    LOG(ERROR) << "[Cache] Corrupted binary cache string (out of bounds)";
+                    return false;
+                }
+                std::string name;
+                if (name_len > 0) {
+                    name.assign(reinterpret_cast<const char*>(ptr), name_len);
+                    ptr += name_len;
+                }
+
+                files_.emplace(id, FileEntry{id, parent_id, std::move(name), is_dir != 0, f_size});
+            }
+            
+            auto t2 = std::chrono::high_resolution_clock::now();
+            double d_read = std::chrono::duration<double>(t1 - t0).count();
+            double d_parse = std::chrono::duration<double>(t2 - t1).count();
+            std::cout << fmt::format("[Cache Load Time] Read: {:.3f}s, Binary Parse & Populate: {:.3f}s\n", d_read, d_parse);
+        } else {
+            // Legacy msgpack/json loading
+            nlohmann::json j = nlohmann::json::from_msgpack(buffer);
+            auto t2 = std::chrono::high_resolution_clock::now();
+            
+            last_usn_ = j.at("last_usn").get<uint64_t>();
+            files_ = j.at("files").get<absl::node_hash_map<uint64_t, FileEntry>>();
+            auto t3 = std::chrono::high_resolution_clock::now();
+            
+            double d_read = std::chrono::duration<double>(t1 - t0).count();
+            double d_parse = std::chrono::duration<double>(t2 - t1).count();
+            double d_convert = std::chrono::duration<double>(t3 - t2).count();
+            std::cout << fmt::format("[Legacy Cache Load Time] Read: {:.3f}s, Msgpack Parse: {:.3f}s, Get Map: {:.3f}s\n", d_read, d_parse, d_convert);
+        }
+        
         return true;
     } catch (const std::exception& e) {
         LOG(ERROR) << "[Cache] Exception while loading cache: " << e.what();

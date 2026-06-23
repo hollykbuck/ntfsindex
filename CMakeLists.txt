@@ -40,6 +40,7 @@ target_link_libraries(ntfsindex PRIVATE
     absl::flags_parse
     absl::log
     absl::log_initialize
+    absl::raw_hash_set
     ftxui::screen
     ftxui::dom
     ftxui::component
@@ -72,6 +73,7 @@ target_link_libraries(ntfs_tests PRIVATE
     Catch2::Catch2WithMain
     absl::log
     absl::log_initialize
+    absl::raw_hash_set
     STDEXEC::stdexec
     STDEXEC::asioexec
     nlohmann_json::nlohmann_json

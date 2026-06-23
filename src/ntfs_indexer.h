@@ -1,6 +1,6 @@
 #pragma once
 
-#include <unordered_map>
+#include "absl/container/node_hash_map.h"
 #include <string>
 #include <vector>
 #include <functional>
@@ -22,7 +22,7 @@ public:
     bool load_from_cache(const std::string& cache_path);
 
     // Get the in-memory files map
-    const std::unordered_map<uint64_t, FileEntry>& get_files() const { return files_; }
+    const absl::node_hash_map<uint64_t, FileEntry>& get_files() const { return files_; }
 
     // Get the last parsed USN
     uint64_t get_last_usn() const { return last_usn_; }
@@ -34,10 +34,10 @@ public:
     std::string get_absolute_path(uint64_t id) const;
 
     // Direct tree manipulation helpers for testing
-    void test_set_files(const std::unordered_map<uint64_t, FileEntry>& files) { files_ = files; }
+    void test_set_files(const absl::node_hash_map<uint64_t, FileEntry>& files) { files_ = files; }
     void test_set_last_usn(uint64_t usn) { last_usn_ = usn; }
 
 private:
-    std::unordered_map<uint64_t, FileEntry> files_;
+    absl::node_hash_map<uint64_t, FileEntry> files_;
     uint64_t last_usn_ = 0;
 };

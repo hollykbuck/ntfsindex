@@ -42,7 +42,7 @@ TEST_CASE("Unpack runs test", "[ntfs]") {
 TEST_CASE("Resolve all paths test", "[ntfs]") {
     NtfsIndexer indexer;
     
-    std::unordered_map<uint64_t, FileEntry> mock_files;
+    absl::node_hash_map<uint64_t, FileEntry> mock_files;
     
     // Root directory (record 5)
     mock_files[5] = FileEntry{5, 5, "root", true, 0};
@@ -92,7 +92,7 @@ TEST_CASE("Resolve all paths test", "[ntfs]") {
 TEST_CASE("Cache save and load test", "[cache]") {
     NtfsIndexer indexer;
     
-    std::unordered_map<uint64_t, FileEntry> mock_files;
+    absl::node_hash_map<uint64_t, FileEntry> mock_files;
     mock_files[5] = FileEntry{5, 5, "root", true, 0};
     mock_files[100] = FileEntry{100, 5, "DirA", true, 0};
     mock_files[101] = FileEntry{101, 100, "FileB.txt", false, 1234};
@@ -128,5 +128,35 @@ TEST_CASE("Cache save and load test", "[cache]") {
     
     // Clean up
     std::filesystem::remove(cache_path);
+}
+
+#include <iostream>
+
+TEST_CASE("Benchmark load cache", "[.benchmark]") {
+    NtfsIndexer indexer;
+    std::string success_path = "";
+    auto start = std::chrono::high_resolution_clock::now();
+    if (indexer.load_from_cache("data.bin")) {
+        success_path = "data.bin";
+    } else if (indexer.load_from_cache("../data.bin")) {
+        success_path = "../data.bin";
+    } else if (indexer.load_from_cache("../../data.bin")) {
+        success_path = "../../data.bin";
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff = end - start;
+    if (!success_path.empty()) {
+        std::cout << "\n[BENCHMARK] Loaded data.bin containing " << indexer.get_files().size()
+                  << " files in " << diff.count() << " seconds.\n" << std::endl;
+        
+        std::cout << "[BENCHMARK] Re-saving cache to " << success_path << " in fast format..." << std::endl;
+        auto save_start = std::chrono::high_resolution_clock::now();
+        indexer.save_to_cache(success_path);
+        auto save_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> save_diff = save_end - save_start;
+        std::cout << "[BENCHMARK] Saved in " << save_diff.count() << " seconds.\n" << std::endl;
+    } else {
+        std::cout << "\n[BENCHMARK] Failed to load data.bin\n" << std::endl;
+    }
 }
 
