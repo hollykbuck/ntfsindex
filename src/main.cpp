@@ -28,7 +28,12 @@
 #include <stdexec/execution.hpp>
 #include <exec/single_thread_context.hpp>
 #include <exec/asio/asio_thread_pool.hpp>
+#include <exec/asio/use_sender.hpp>
 #include <utility>
+
+#include <boost/beast/http.hpp>
+#include <boost/beast/core.hpp>
+
 
 using SchedulerType = decltype(std::declval<exec::single_thread_context>().get_scheduler());
 

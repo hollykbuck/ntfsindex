@@ -4,6 +4,7 @@
 #include "ntfs_indexer.h"
 #include <stdexec/execution.hpp>
 #include <exec/start_detached.hpp>
+#include <exec/asio/use_sender.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
@@ -545,34 +546,58 @@ handle_request(
 }
 
 // Handles an HTTP server connection
-void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer, HttpServer::WorkerSchedulerType scheduler, std::string dev_path) {
-    bool close = false;
-    beast::error_code ec;
-
-    beast::flat_buffer buffer;
-
-    for(;;) {
+void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer,
+                HttpServer::WorkerSchedulerType worker_scheduler, HttpServer::IoSchedulerType io_scheduler, std::string dev_path) {
+    struct Session {
+        tcp::socket socket;
+        beast::flat_buffer buffer;
         http::request<http::string_body> req;
-        http::read(socket, buffer, req, ec);
-        if(ec == http::error::end_of_stream)
-            break;
-        if(ec) {
-            break;
-        }
-
-        auto msg = handle_request(doc_root, std::move(req), parser, indexer, scheduler, dev_path);
-        close = !msg.keep_alive();
+    };
+    
+    auto s = std::make_shared<Session>(Session{std::move(socket), {}, {}});
+    
+    auto run_cycle = std::make_shared<std::function<void()>>();
+    *run_cycle = [s, doc_root, &parser, &indexer, worker_scheduler, io_scheduler, dev_path, run_cycle]() {
+        auto read_sender = http::async_read(s->socket, s->buffer, s->req, exec::asio::use_sender);
         
-        beast::write(socket, std::move(msg), ec);
-        if(ec) {
-            break;
-        }
-        if(close) {
-            break;
-        }
-    }
+        auto pipeline = std::move(read_sender)
+            | stdexec::continues_on(worker_scheduler)
+            | stdexec::then([s, doc_root, &parser, &indexer, worker_scheduler, dev_path](std::size_t) mutable {
+                auto msg = handle_request(doc_root, std::move(s->req), parser, indexer, worker_scheduler, dev_path);
+                bool keep_alive = msg.keep_alive();
+                return std::make_pair(std::move(msg), keep_alive);
+            })
+            | stdexec::continues_on(io_scheduler)
+            | stdexec::let_value([s](std::pair<http::message_generator, bool>& result) mutable {
+                auto msg = std::move(result.first);
+                bool keep_alive = result.second;
+                return beast::async_write(s->socket, std::move(msg), exec::asio::use_sender)
+                    | stdexec::then([keep_alive](std::size_t) {
+                        return keep_alive;
+                    });
+            })
+            | stdexec::then([s, run_cycle](bool keep_alive) {
+                if (keep_alive) {
+                    s->req = {};
+                    (*run_cycle)();
+                } else {
+                    boost::system::error_code ec;
+                    s->socket.shutdown(tcp::socket::shutdown_both, ec);
+                }
+            })
+            | stdexec::upon_error([s](std::exception_ptr) {
+                boost::system::error_code ec;
+                s->socket.shutdown(tcp::socket::shutdown_both, ec);
+            })
+            | stdexec::upon_stopped([s]() {
+                boost::system::error_code ec;
+                s->socket.shutdown(tcp::socket::shutdown_both, ec);
+            });
 
-    socket.shutdown(tcp::socket::shutdown_both, ec);
+        exec::start_detached(std::move(pipeline));
+    };
+
+    (*run_cycle)();
 }
 
 } // namespace
@@ -601,6 +626,7 @@ bool HttpServer::run() {
                         parser_,
                         indexer_,
                         worker_scheduler_,
+                        io_scheduler_,
                         dev_path_
                     );
                 });
