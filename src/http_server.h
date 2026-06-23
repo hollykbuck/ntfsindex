@@ -48,51 +48,38 @@ struct HttpContext {
 };
 
 namespace context {
-    struct get_parser_t : stdexec::forwarding_query_t {
-        template <typename Env>
-        constexpr decltype(auto) operator()(const Env& env) const noexcept {
-            return env.query(*this);
-        }
+    struct get_context_t : stdexec::__query<get_context_t>, stdexec::forwarding_query_t {
+        using stdexec::__query<get_context_t>::operator();
+    };
+    inline constexpr get_context_t get_context{};
+
+    struct get_parser_t : stdexec::__query<get_parser_t>, stdexec::forwarding_query_t {
+        using stdexec::__query<get_parser_t>::operator();
     };
     inline constexpr get_parser_t get_parser{};
 
-    struct get_indexer_t : stdexec::forwarding_query_t {
-        template <typename Env>
-        constexpr decltype(auto) operator()(const Env& env) const noexcept {
-            return env.query(*this);
-        }
+    struct get_indexer_t : stdexec::__query<get_indexer_t>, stdexec::forwarding_query_t {
+        using stdexec::__query<get_indexer_t>::operator();
     };
     inline constexpr get_indexer_t get_indexer{};
 
-    struct get_worker_scheduler_t : stdexec::forwarding_query_t {
-        template <typename Env>
-        constexpr decltype(auto) operator()(const Env& env) const noexcept {
-            return env.query(*this);
-        }
+    struct get_worker_scheduler_t : stdexec::__query<get_worker_scheduler_t>, stdexec::forwarding_query_t {
+        using stdexec::__query<get_worker_scheduler_t>::operator();
     };
     inline constexpr get_worker_scheduler_t get_worker_scheduler{};
 
-    struct get_io_scheduler_t : stdexec::forwarding_query_t {
-        template <typename Env>
-        constexpr decltype(auto) operator()(const Env& env) const noexcept {
-            return env.query(*this);
-        }
+    struct get_io_scheduler_t : stdexec::__query<get_io_scheduler_t>, stdexec::forwarding_query_t {
+        using stdexec::__query<get_io_scheduler_t>::operator();
     };
     inline constexpr get_io_scheduler_t get_io_scheduler{};
 
-    struct get_doc_root_t : stdexec::forwarding_query_t {
-        template <typename Env>
-        constexpr decltype(auto) operator()(const Env& env) const noexcept {
-            return env.query(*this);
-        }
+    struct get_doc_root_t : stdexec::__query<get_doc_root_t>, stdexec::forwarding_query_t {
+        using stdexec::__query<get_doc_root_t>::operator();
     };
     inline constexpr get_doc_root_t get_doc_root{};
 
-    struct get_dev_path_t : stdexec::forwarding_query_t {
-        template <typename Env>
-        constexpr decltype(auto) operator()(const Env& env) const noexcept {
-            return env.query(*this);
-        }
+    struct get_dev_path_t : stdexec::__query<get_dev_path_t>, stdexec::forwarding_query_t {
+        using stdexec::__query<get_dev_path_t>::operator();
     };
     inline constexpr get_dev_path_t get_dev_path{};
 }

@@ -548,32 +548,7 @@ handle_request(
 }
 
 inline auto read_context() {
-    return stdexec::read_env(context::get_parser)
-        | stdexec::let_value([](auto parser_ref) {
-            return stdexec::read_env(context::get_indexer)
-                | stdexec::let_value([parser_ref](auto indexer_ref) {
-                    return stdexec::read_env(context::get_worker_scheduler)
-                        | stdexec::let_value([parser_ref, indexer_ref](auto worker_scheduler) {
-                            return stdexec::read_env(context::get_io_scheduler)
-                                | stdexec::let_value([parser_ref, indexer_ref, worker_scheduler](auto io_scheduler) {
-                                    return stdexec::read_env(context::get_doc_root)
-                                        | stdexec::let_value([parser_ref, indexer_ref, worker_scheduler, io_scheduler](auto doc_root_sv) {
-                                            return stdexec::read_env(context::get_dev_path)
-                                                | stdexec::then([parser_ref, indexer_ref, worker_scheduler, io_scheduler, doc_root_sv](auto dev_path_sv) {
-                                                    return HttpContext{
-                                                        parser_ref.get(),
-                                                        indexer_ref.get(),
-                                                        worker_scheduler,
-                                                        io_scheduler,
-                                                        doc_root_sv,
-                                                        dev_path_sv
-                                                    };
-                                                });
-                                        });
-                                });
-                        });
-                });
-        });
+    return stdexec::read_env(context::get_context);
 }
 
 // Handles an HTTP server connection
@@ -592,7 +567,7 @@ void do_session(tcp::socket socket, const HttpContext& ctx, exec::async_scope& s
         
         auto pipeline = std::move(read_sender)
             | stdexec::continues_on(ctx.worker_scheduler)
-            | stdexec::let_value([s]() mutable {
+            | stdexec::let_value([s](std::size_t) mutable {
                 return read_context()
                     | stdexec::then([s](const HttpContext& read_ctx) mutable {
                         auto msg = handle_request(std::move(s->req), read_ctx);
@@ -626,14 +601,7 @@ void do_session(tcp::socket socket, const HttpContext& ctx, exec::async_scope& s
                 boost::system::error_code ec;
                 s->socket.shutdown(tcp::socket::shutdown_both, ec);
             })
-            | stdexec::write_env(stdexec::env{
-                stdexec::prop{context::get_parser, std::ref(ctx.parser)},
-                stdexec::prop{context::get_indexer, std::ref(ctx.indexer)},
-                stdexec::prop{context::get_worker_scheduler, ctx.worker_scheduler},
-                stdexec::prop{context::get_io_scheduler, ctx.io_scheduler},
-                stdexec::prop{context::get_doc_root, ctx.doc_root},
-                stdexec::prop{context::get_dev_path, ctx.dev_path}
-            });
+            | stdexec::write_env(stdexec::prop{context::get_context, std::ref(ctx)});
 
         scope.spawn(std::move(pipeline));
     };
