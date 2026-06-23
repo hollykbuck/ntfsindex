@@ -27,6 +27,7 @@
 #include <memory>
 #include <stdexec/execution.hpp>
 #include <exec/single_thread_context.hpp>
+#include <exec/asio/asio_thread_pool.hpp>
 #include <utility>
 
 using SchedulerType = decltype(std::declval<exec::single_thread_context>().get_scheduler());
@@ -175,7 +176,11 @@ int main(int argc, char* argv[]) {
     exec::single_thread_context worker_ctx;
     auto scheduler = worker_ctx.get_scheduler();
 
+    exec::asio::asio_thread_pool io_pool(2);
+    auto io_scheduler = io_pool.get_scheduler();
+
     NtfsParser parser;
+
     NtfsIndexer indexer;
 
     auto init_sender = stdexec::schedule(scheduler)
@@ -211,7 +216,7 @@ int main(int argc, char* argv[]) {
         TuiClient tui(parser, indexer);
         tui.run();
     } else {
-        HttpServer server(parser, indexer, scheduler, config.address, config.port, config.doc_root, config.device_path);
+        HttpServer server(parser, indexer, scheduler, io_scheduler, config.address, config.port, config.doc_root, config.device_path);
         if (!server.run()) {
             return 1;
         }

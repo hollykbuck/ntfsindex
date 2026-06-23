@@ -43,6 +43,7 @@ target_link_libraries(ntfsindex PRIVATE
     ftxui::dom
     ftxui::component
     STDEXEC::stdexec
+    STDEXEC::asioexec
 )
 
 # Enable compiler warnings
@@ -70,6 +71,7 @@ target_link_libraries(ntfs_tests PRIVATE
     absl::log
     absl::log_initialize
     STDEXEC::stdexec
+    STDEXEC::asioexec
 )
 if(MSVC)
     target_compile_options(ntfs_tests PRIVATE /W4)

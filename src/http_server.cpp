@@ -3,8 +3,7 @@
 #include "absl/log/log.h"
 #include "ntfs_indexer.h"
 #include <stdexec/execution.hpp>
-
-
+#include <exec/start_detached.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
@@ -146,7 +145,7 @@ handle_request(
     http::request<Body, http::basic_fields<Allocator>>&& req,
     NtfsParser& parser,
     NtfsIndexer& indexer,
-    HttpServer::SchedulerType scheduler,
+    HttpServer::WorkerSchedulerType scheduler,
     const std::string& dev_path)
 {
     auto const bad_request =
@@ -546,7 +545,7 @@ handle_request(
 }
 
 // Handles an HTTP server connection
-void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer, HttpServer::SchedulerType scheduler, std::string dev_path) {
+void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer, HttpServer::WorkerSchedulerType scheduler, std::string dev_path) {
     bool close = false;
     beast::error_code ec;
 
@@ -578,8 +577,8 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
 
 } // namespace
 
-HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, SchedulerType scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path)
-    : parser_(parser), indexer_(indexer), scheduler_(scheduler), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path) {}
+HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, WorkerSchedulerType worker_scheduler, IoSchedulerType io_scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path)
+    : parser_(parser), indexer_(indexer), worker_scheduler_(worker_scheduler), io_scheduler_(io_scheduler), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path) {}
 
 HttpServer::~HttpServer() = default;
 
@@ -594,15 +593,18 @@ bool HttpServer::run() {
             tcp::socket socket{ioc};
             acceptor.accept(socket);
 
-            std::thread(
-                do_session,
-                std::move(socket),
-                doc_root_,
-                std::ref(parser_),
-                std::ref(indexer_),
-                scheduler_,
-                dev_path_
-            ).detach();
+            auto session_sender = stdexec::schedule(io_scheduler_)
+                | stdexec::then([s = std::move(socket), this]() mutable {
+                    do_session(
+                        std::move(s),
+                        doc_root_,
+                        parser_,
+                        indexer_,
+                        worker_scheduler_,
+                        dev_path_
+                    );
+                });
+            exec::start_detached(std::move(session_sender));
         }
     } catch (const std::exception& e) {
         LOG(ERROR) << "[HTTP Server] Error: " << e.what();
