@@ -142,13 +142,15 @@ std::string to_lowercase(const std::string& str) {
 template<class Body, class Allocator>
 http::message_generator
 handle_request(
-    beast::string_view doc_root,
     http::request<Body, http::basic_fields<Allocator>>&& req,
-    NtfsParser& parser,
-    NtfsIndexer& indexer,
-    HttpServer::WorkerSchedulerType scheduler,
-    const std::string& dev_path)
+    const HttpContext& ctx)
 {
+    auto& parser = ctx.parser;
+    auto& indexer = ctx.indexer;
+    auto scheduler = ctx.worker_scheduler;
+    beast::string_view doc_root = ctx.doc_root;
+    std::string dev_path(ctx.dev_path);
+
     auto const bad_request =
     [&req](beast::string_view why)
     {
@@ -545,10 +547,37 @@ handle_request(
     return res;
 }
 
+inline auto read_context() {
+    return stdexec::read_env(context::get_parser)
+        | stdexec::let_value([](auto parser_ref) {
+            return stdexec::read_env(context::get_indexer)
+                | stdexec::let_value([parser_ref](auto indexer_ref) {
+                    return stdexec::read_env(context::get_worker_scheduler)
+                        | stdexec::let_value([parser_ref, indexer_ref](auto worker_scheduler) {
+                            return stdexec::read_env(context::get_io_scheduler)
+                                | stdexec::let_value([parser_ref, indexer_ref, worker_scheduler](auto io_scheduler) {
+                                    return stdexec::read_env(context::get_doc_root)
+                                        | stdexec::let_value([parser_ref, indexer_ref, worker_scheduler, io_scheduler](auto doc_root_sv) {
+                                            return stdexec::read_env(context::get_dev_path)
+                                                | stdexec::then([parser_ref, indexer_ref, worker_scheduler, io_scheduler, doc_root_sv](auto dev_path_sv) {
+                                                    return HttpContext{
+                                                        parser_ref.get(),
+                                                        indexer_ref.get(),
+                                                        worker_scheduler,
+                                                        io_scheduler,
+                                                        doc_root_sv,
+                                                        dev_path_sv
+                                                    };
+                                                });
+                                        });
+                                });
+                        });
+                });
+        });
+}
+
 // Handles an HTTP server connection
-void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer,
-                HttpServer::WorkerSchedulerType worker_scheduler, HttpServer::IoSchedulerType io_scheduler,
-                exec::async_scope& scope, std::string dev_path) {
+void do_session(tcp::socket socket, const HttpContext& ctx, exec::async_scope& scope) {
     struct Session {
         tcp::socket socket;
         beast::flat_buffer buffer;
@@ -558,17 +587,20 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
     auto s = std::make_shared<Session>(Session{std::move(socket), {}, {}});
     
     auto run_cycle = std::make_shared<std::function<void()>>();
-    *run_cycle = [s, doc_root, &parser, &indexer, worker_scheduler, io_scheduler, &scope, dev_path, run_cycle]() {
+    *run_cycle = [s, ctx, &scope, run_cycle]() {
         auto read_sender = http::async_read(s->socket, s->buffer, s->req, exec::asio::use_sender);
         
         auto pipeline = std::move(read_sender)
-            | stdexec::continues_on(worker_scheduler)
-            | stdexec::then([s, doc_root, &parser, &indexer, worker_scheduler, dev_path](std::size_t) mutable {
-                auto msg = handle_request(doc_root, std::move(s->req), parser, indexer, worker_scheduler, dev_path);
-                bool keep_alive = msg.keep_alive();
-                return std::make_pair(std::move(msg), keep_alive);
+            | stdexec::continues_on(ctx.worker_scheduler)
+            | stdexec::let_value([s]() mutable {
+                return read_context()
+                    | stdexec::then([s](const HttpContext& read_ctx) mutable {
+                        auto msg = handle_request(std::move(s->req), read_ctx);
+                        bool keep_alive = msg.keep_alive();
+                        return std::make_pair(std::move(msg), keep_alive);
+                    });
             })
-            | stdexec::continues_on(io_scheduler)
+            | stdexec::continues_on(ctx.io_scheduler)
             | stdexec::let_value([s](std::pair<http::message_generator, bool>& result) mutable {
                 auto msg = std::move(result.first);
                 bool keep_alive = result.second;
@@ -593,6 +625,14 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
             | stdexec::upon_stopped([s]() {
                 boost::system::error_code ec;
                 s->socket.shutdown(tcp::socket::shutdown_both, ec);
+            })
+            | stdexec::write_env(stdexec::env{
+                stdexec::prop{context::get_parser, std::ref(ctx.parser)},
+                stdexec::prop{context::get_indexer, std::ref(ctx.indexer)},
+                stdexec::prop{context::get_worker_scheduler, ctx.worker_scheduler},
+                stdexec::prop{context::get_io_scheduler, ctx.io_scheduler},
+                stdexec::prop{context::get_doc_root, ctx.doc_root},
+                stdexec::prop{context::get_dev_path, ctx.dev_path}
             });
 
         scope.spawn(std::move(pipeline));
@@ -617,21 +657,25 @@ bool HttpServer::run() {
         LOG(INFO) << fmt::format("[HTTP Server] Listening on http://{}:{}/", address_, port_);
         LOG(INFO) << fmt::format("[HTTP Server] Serving static files from: {}", doc_root_);
 
+        HttpContext ctx{
+            parser_,
+            indexer_,
+            worker_scheduler_,
+            io_scheduler_,
+            doc_root_,
+            dev_path_
+        };
+
         for(;;) {
             tcp::socket socket{ioc};
             acceptor.accept(socket);
 
             auto session_sender = stdexec::schedule(io_scheduler_)
-                | stdexec::then([s = std::move(socket), this]() mutable {
+                | stdexec::then([s = std::move(socket), this, ctx]() mutable {
                     do_session(
                         std::move(s),
-                        doc_root_,
-                        parser_,
-                        indexer_,
-                        worker_scheduler_,
-                        io_scheduler_,
-                        scope_,
-                        dev_path_
+                        ctx,
+                        scope_
                     );
                 });
             scope_.spawn(std::move(session_sender));
@@ -646,3 +690,4 @@ bool HttpServer::run() {
 void HttpServer::stop() {
     stdexec::sync_wait(scope_.on_empty());
 }
+
