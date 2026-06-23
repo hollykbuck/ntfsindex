@@ -7,6 +7,7 @@ abseil/20260107.1
 boost/1.91.0
 ftxui/6.1.9
 p2300/1767b0a217037ed04b49e1bd911b1f11c4dc6160
+re2/20251105
 
 [generators]
 CMakeDeps

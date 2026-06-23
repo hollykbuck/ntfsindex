@@ -14,7 +14,7 @@
 #include <stdexec/execution.hpp>
 #include <exec/single_thread_context.hpp>
 #include <exec/async_scope.hpp>
-#include <regex>
+#include <re2/re2.h>
 #include <fstream>
 #include <sstream>
 #include "absl/log/log.h"
@@ -201,13 +201,16 @@ void TuiClient::run() {
                     std::vector<const FileEntry*> temp_filtered;
                     std::vector<std::string> temp_names;
                     bool regex_valid = true;
-                    std::regex pattern;
+                    std::string local_regex_error = "";
+                    std::unique_ptr<RE2> pattern;
 
                     if (current_use_regex && !query.empty()) {
-                        try {
-                            pattern = std::regex(query, std::regex_constants::ECMAScript | std::regex_constants::icase);
-                        } catch (const std::regex_error&) {
+                        RE2::Options options;
+                        options.set_case_sensitive(false);
+                        pattern = std::make_unique<RE2>(query, options);
+                        if (!pattern->ok()) {
                             regex_valid = false;
+                            local_regex_error = "Invalid Regex: " + pattern->error();
                         }
                     }
 
@@ -217,7 +220,7 @@ void TuiClient::run() {
                             if (my_id == search_id.load()) {
                                 bg_filtered_files.clear();
                                 bg_file_names.clear();
-                                bg_regex_error = "Invalid Regular Expression";
+                                bg_regex_error = local_regex_error;
                                 bg_search_duration_ms = 0.0;
                                 bg_results_ready = true;
                                 screen.PostEvent(Event::Custom);
@@ -237,7 +240,7 @@ void TuiClient::run() {
                         if (query.empty()) {
                             match = true;
                         } else if (current_use_regex) {
-                            match = std::regex_search(file->name, pattern);
+                            match = RE2::PartialMatch(file->name, *pattern);
                         } else {
                             std::string name_lower = file->name;
                             std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);

@@ -15,6 +15,7 @@ find_package(nlohmann_json REQUIRED)
 find_package(absl REQUIRED)
 find_package(ftxui REQUIRED)
 find_package(P2300 REQUIRED)
+find_package(re2 REQUIRED)
 
 # Executable definition
 add_executable(ntfsindex
@@ -44,6 +45,7 @@ target_link_libraries(ntfsindex PRIVATE
     ftxui::component
     STDEXEC::stdexec
     STDEXEC::asioexec
+    re2::re2
 )
 
 # Enable compiler warnings
