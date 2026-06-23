@@ -45,49 +45,46 @@ TEST_CASE("Resolve all paths test", "[ntfs]") {
     std::unordered_map<uint64_t, FileEntry> mock_files;
     
     // Root directory (record 5)
-    mock_files[5] = FileEntry{5, 5, "root", true, 0, ""};
+    mock_files[5] = FileEntry{5, 5, "root", true, 0};
     
     // Dir A (record 100) -> child of root
-    mock_files[100] = FileEntry{100, 5, "DirA", true, 0, ""};
+    mock_files[100] = FileEntry{100, 5, "DirA", true, 0};
     
     // File B (record 101) -> child of Dir A
-    mock_files[101] = FileEntry{101, 100, "FileB.txt", false, 1234, ""};
+    mock_files[101] = FileEntry{101, 100, "FileB.txt", false, 1234};
     
     // Dir C (record 102) -> child of Dir A
-    mock_files[102] = FileEntry{102, 100, "DirC", true, 0, ""};
+    mock_files[102] = FileEntry{102, 100, "DirC", true, 0};
     
     // File D (record 103) -> child of Dir C
-    mock_files[103] = FileEntry{103, 102, "FileD.bin", false, 5678, ""};
+    mock_files[103] = FileEntry{103, 102, "FileD.bin", false, 5678};
     
     // Orphan File E (record 200) -> parent 999 (missing)
-    mock_files[200] = FileEntry{200, 999, "OrphanE.txt", false, 999, ""};
+    mock_files[200] = FileEntry{200, 999, "OrphanE.txt", false, 999};
     
     // Orphan Dir F (record 201) -> child of Orphan File E
-    mock_files[201] = FileEntry{201, 200, "OrphanF", true, 0, ""};
+    mock_files[201] = FileEntry{201, 200, "OrphanF", true, 0};
     
     // Cycle Dir X (record 300) -> parent Y
-    mock_files[300] = FileEntry{300, 301, "DirX", true, 0, ""};
+    mock_files[300] = FileEntry{300, 301, "DirX", true, 0};
     
     // Cycle Dir Y (record 301) -> parent X
-    mock_files[301] = FileEntry{301, 300, "DirY", true, 0, ""};
+    mock_files[301] = FileEntry{301, 300, "DirY", true, 0};
     
     indexer.test_set_files(mock_files);
-    indexer.test_resolve_all_paths();
     
-    const auto& resolved = indexer.get_files();
+    REQUIRE(indexer.get_absolute_path(5) == "/");
+    REQUIRE(indexer.get_absolute_path(100) == "/DirA");
+    REQUIRE(indexer.get_absolute_path(101) == "/DirA/FileB.txt");
+    REQUIRE(indexer.get_absolute_path(102) == "/DirA/DirC");
+    REQUIRE(indexer.get_absolute_path(103) == "/DirA/DirC/FileD.bin");
     
-    REQUIRE(resolved.at(5).full_path == "/");
-    REQUIRE(resolved.at(100).full_path == "/DirA");
-    REQUIRE(resolved.at(101).full_path == "/DirA/FileB.txt");
-    REQUIRE(resolved.at(102).full_path == "/DirA/DirC");
-    REQUIRE(resolved.at(103).full_path == "/DirA/DirC/FileD.bin");
-    
-    REQUIRE(resolved.at(200).full_path == "/[orphan]/OrphanE.txt");
-    REQUIRE(resolved.at(201).full_path == "/[orphan]/OrphanE.txt/OrphanF");
+    REQUIRE(indexer.get_absolute_path(200) == "/[orphan]/OrphanE.txt");
+    REQUIRE(indexer.get_absolute_path(201) == "/[orphan]/OrphanE.txt/OrphanF");
     
     // Check cycle protection doesn't crash or loop infinitely
-    REQUIRE_NOTHROW(resolved.at(300).full_path);
-    REQUIRE_NOTHROW(resolved.at(301).full_path);
+    REQUIRE_NOTHROW(indexer.get_absolute_path(300));
+    REQUIRE_NOTHROW(indexer.get_absolute_path(301));
 }
 
 #include <filesystem>
@@ -96,9 +93,9 @@ TEST_CASE("Cache save and load test", "[cache]") {
     NtfsIndexer indexer;
     
     std::unordered_map<uint64_t, FileEntry> mock_files;
-    mock_files[5] = FileEntry{5, 5, "root", true, 0, "/"};
-    mock_files[100] = FileEntry{100, 5, "DirA", true, 0, "/DirA"};
-    mock_files[101] = FileEntry{101, 100, "FileB.txt", false, 1234, "/DirA/FileB.txt"};
+    mock_files[5] = FileEntry{5, 5, "root", true, 0};
+    mock_files[100] = FileEntry{100, 5, "DirA", true, 0};
+    mock_files[101] = FileEntry{101, 100, "FileB.txt", false, 1234};
     
     indexer.test_set_files(mock_files);
     indexer.test_set_last_usn(0x123456789ABCDEF0ULL);
@@ -126,7 +123,7 @@ TEST_CASE("Cache save and load test", "[cache]") {
         REQUIRE(loaded_files.at(100).name == "DirA");
         REQUIRE(loaded_files.at(101).name == "FileB.txt");
         REQUIRE(loaded_files.at(101).size == 1234);
-        REQUIRE(loaded_files.at(101).full_path == "/DirA/FileB.txt");
+        REQUIRE(loaded_indexer.get_absolute_path(101) == "/DirA/FileB.txt");
     }
     
     // Clean up

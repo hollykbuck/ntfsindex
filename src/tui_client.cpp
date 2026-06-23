@@ -542,7 +542,7 @@ void TuiClient::run() {
     };
 
     auto catch_exit = CatchEvent(renderer, [&](Event event) {
-        LOG(INFO) << "TuiClient: CatchEvent received event: " << event_to_string(event);
+        VLOG(1) << "TuiClient: CatchEvent received event: " << event_to_string(event);
         if (event == Event::F10 || is_ctrl_key(event, 'Q')) {
             LOG(INFO) << "TuiClient: Matched exit hotkey (F10 or Ctrl+Q). Triggering exit.";
             screen.ExitLoopClosure()();
@@ -789,7 +789,10 @@ void TuiClient::run() {
                             temp_all_files.push_back(&entry);
                         }
                         std::sort(temp_all_files.begin(), temp_all_files.end(), [](const FileEntry* a, const FileEntry* b) {
-                            return a->full_path < b->full_path;
+                            if (a->is_directory != b->is_directory) {
+                                return a->is_directory > b->is_directory;
+                            }
+                            return a->name < b->name;
                         });
 
                         {
