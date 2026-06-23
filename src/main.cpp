@@ -25,6 +25,12 @@
 #include <mutex>
 #include <cstdlib>
 #include <memory>
+#include <stdexec/execution.hpp>
+#include <exec/single_thread_context.hpp>
+#include <utility>
+
+using SchedulerType = decltype(std::declval<exec::single_thread_context>().get_scheduler());
+
 
 namespace {
 
@@ -166,22 +172,36 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << fmt::format("  - Frontend Root:   {}", config.doc_root);
     LOG(INFO) << "---------------------------------------------";
 
-    LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
+    exec::single_thread_context worker_ctx;
+    auto scheduler = worker_ctx.get_scheduler();
+
     NtfsParser parser;
-    if (!parser.init(config.device_path)) {
-        return 1;
-    }
-
-    LOG(INFO) << "Starting MFT metadata parse...";
-    if (!parser.parse()) {
-        LOG(ERROR) << "Error: MFT parsing failed.";
-        return 1;
-    }
-
-    LOG(INFO) << "Building initial file index...";
     NtfsIndexer indexer;
-    if (!indexer.build_initial_index(parser)) {
-        LOG(ERROR) << "Error: Index build failed.";
+
+    auto init_sender = stdexec::schedule(scheduler)
+        | stdexec::then([&]() -> bool {
+            LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
+            if (!parser.init(config.device_path)) {
+                return false;
+            }
+
+            LOG(INFO) << "Starting MFT metadata parse...";
+            if (!parser.parse()) {
+                LOG(ERROR) << "Error: MFT parsing failed.";
+                return false;
+            }
+
+            LOG(INFO) << "Building initial file index...";
+            if (!indexer.build_initial_index(parser)) {
+                LOG(ERROR) << "Error: Index build failed.";
+                return false;
+            }
+
+            return true;
+        });
+
+    auto init_result = stdexec::sync_wait(std::move(init_sender));
+    if (!init_result || !std::get<0>(*init_result)) {
         return 1;
     }
 
@@ -191,7 +211,7 @@ int main(int argc, char* argv[]) {
         TuiClient tui(parser, indexer);
         tui.run();
     } else {
-        HttpServer server(parser, indexer, config.address, config.port, config.doc_root, config.device_path);
+        HttpServer server(parser, indexer, scheduler, config.address, config.port, config.doc_root, config.device_path);
         if (!server.run()) {
             return 1;
         }

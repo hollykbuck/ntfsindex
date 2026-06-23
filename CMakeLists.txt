@@ -14,6 +14,7 @@ find_package(Boost REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(absl REQUIRED)
 find_package(ftxui REQUIRED)
+find_package(P2300 REQUIRED)
 
 # Executable definition
 add_executable(ntfsindex
@@ -32,7 +33,7 @@ add_executable(ntfsindex
 # Link dependencies
 target_link_libraries(ntfsindex PRIVATE
     fmt::fmt
-    boost::boost
+    Boost::boost
     nlohmann_json::nlohmann_json
     absl::flags
     absl::flags_parse
@@ -41,6 +42,7 @@ target_link_libraries(ntfsindex PRIVATE
     ftxui::screen
     ftxui::dom
     ftxui::component
+    STDEXEC::stdexec
 )
 
 # Enable compiler warnings
@@ -67,6 +69,7 @@ target_link_libraries(ntfs_tests PRIVATE
     Catch2::Catch2WithMain
     absl::log
     absl::log_initialize
+    STDEXEC::stdexec
 )
 if(MSVC)
     target_compile_options(ntfs_tests PRIVATE /W4)

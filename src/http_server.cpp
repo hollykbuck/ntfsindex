@@ -2,6 +2,8 @@
 #include "ntfs_parser.h"
 #include "absl/log/log.h"
 #include "ntfs_indexer.h"
+#include <stdexec/execution.hpp>
+
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -144,7 +146,7 @@ handle_request(
     http::request<Body, http::basic_fields<Allocator>>&& req,
     NtfsParser& parser,
     NtfsIndexer& indexer,
-    std::mutex& mtx,
+    HttpServer::SchedulerType scheduler,
     const std::string& dev_path)
 {
     auto const bad_request =
@@ -234,20 +236,24 @@ handle_request(
 
         std::string query_lower = to_lowercase(query);
 
-        std::vector<FileEntry> matches;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            const auto& files = indexer.get_files();
+        auto search_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> std::vector<FileEntry> {
+                std::vector<FileEntry> m;
+                const auto& files = indexer.get_files();
+                for (const auto& [id, entry] : files) {
+                    std::string name_lower = to_lowercase(entry.name);
+                    std::string path_lower = to_lowercase(entry.full_path);
 
-            for (const auto& [id, entry] : files) {
-                std::string name_lower = to_lowercase(entry.name);
-                std::string path_lower = to_lowercase(entry.full_path);
-
-                if (name_lower.find(query_lower) != std::string::npos || path_lower.find(query_lower) != std::string::npos) {
-                    matches.push_back(entry);
+                    if (name_lower.find(query_lower) != std::string::npos || path_lower.find(query_lower) != std::string::npos) {
+                        m.push_back(entry);
+                    }
                 }
-            }
-        }
+                return m;
+            });
+
+        auto search_result = stdexec::sync_wait(std::move(search_sender));
+        std::vector<FileEntry> matches = search_result ? std::get<0>(*search_result) : std::vector<FileEntry>{};
+
 
         // Sort matches: Directories first, then alphabetically by full path
         std::sort(matches.begin(), matches.end(), [](const FileEntry& a, const FileEntry& b) {
@@ -286,22 +292,38 @@ handle_request(
             return bad_request("Unknown HTTP-method for /api/stats");
         }
 
+        struct StatsResult {
+            size_t file_count = 0;
+            size_t dir_count = 0;
+            uint64_t total_bytes = 0;
+        };
+
+        auto stats_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> StatsResult {
+                StatsResult res;
+                const auto& files = indexer.get_files();
+                for (const auto& [id, entry] : files) {
+                    if (entry.is_directory) {
+                        res.dir_count++;
+                    } else {
+                        res.file_count++;
+                        res.total_bytes += entry.size;
+                    }
+                }
+                return res;
+            });
+
+        auto stats_result = stdexec::sync_wait(std::move(stats_sender));
         size_t file_count = 0;
         size_t dir_count = 0;
         uint64_t total_bytes = 0;
-
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            const auto& files = indexer.get_files();
-            for (const auto& [id, entry] : files) {
-                if (entry.is_directory) {
-                    dir_count++;
-                } else {
-                    file_count++;
-                    total_bytes += entry.size;
-                }
-            }
+        if (stats_result) {
+            auto res = std::get<0>(*stats_result);
+            file_count = res.file_count;
+            dir_count = res.dir_count;
+            total_bytes = res.total_bytes;
         }
+
 
         auto format_size_local = [](uint64_t bytes) {
             const char* suffixes[] = {"B", "KB", "MB", "GB", "TB"};
@@ -338,25 +360,39 @@ handle_request(
             } catch (...) {}
         }
 
+        struct UsnResult {
+            bool success = false;
+            std::vector<NtfsParser::UsnJournalEntry> usn_entries;
+        };
+
+        auto usn_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> UsnResult {
+                UsnResult res;
+                const auto& files = indexer.get_files();
+
+                uint64_t usn_mft_idx = 0;
+                for (const auto& [id, entry] : files) {
+                    if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
+                        usn_mft_idx = id;
+                        break;
+                    }
+                }
+
+                if (usn_mft_idx != 0) {
+                    res.success = parser.parse_usn_journal(res.usn_entries, usn_mft_idx);
+                }
+                return res;
+            });
+
+        auto usn_result = stdexec::sync_wait(std::move(usn_sender));
         std::vector<NtfsParser::UsnJournalEntry> usn_entries;
         bool success = false;
-        
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            const auto& files = indexer.get_files();
-
-            uint64_t usn_mft_idx = 0;
-            for (const auto& [id, entry] : files) {
-                if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
-                    usn_mft_idx = id;
-                    break;
-                }
-            }
-
-            if (usn_mft_idx != 0) {
-                success = parser.parse_usn_journal(usn_entries, usn_mft_idx);
-            }
+        if (usn_result) {
+            auto res = std::get<0>(*usn_result);
+            success = res.success;
+            usn_entries = std::move(res.usn_entries);
         }
+
 
         if (!success) {
             return json_response(json{
@@ -432,12 +468,15 @@ handle_request(
         }
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = false;
-        
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            success = indexer.update_index_incremental(parser);
-        }
+
+        auto update_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> bool {
+                return indexer.update_index_incremental(parser);
+            });
+
+        auto update_result = stdexec::sync_wait(std::move(update_sender));
+        bool success = update_result ? std::get<0>(*update_result) : false;
+
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -507,7 +546,7 @@ handle_request(
 }
 
 // Handles an HTTP server connection
-void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer, std::mutex& mtx, std::string dev_path) {
+void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer, HttpServer::SchedulerType scheduler, std::string dev_path) {
     bool close = false;
     beast::error_code ec;
 
@@ -522,7 +561,7 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
             break;
         }
 
-        auto msg = handle_request(doc_root, std::move(req), parser, indexer, mtx, dev_path);
+        auto msg = handle_request(doc_root, std::move(req), parser, indexer, scheduler, dev_path);
         close = !msg.keep_alive();
         
         beast::write(socket, std::move(msg), ec);
@@ -539,8 +578,8 @@ void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, Nt
 
 } // namespace
 
-HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path)
-    : parser_(parser), indexer_(indexer), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path) {}
+HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, SchedulerType scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path)
+    : parser_(parser), indexer_(indexer), scheduler_(scheduler), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path) {}
 
 HttpServer::~HttpServer() = default;
 
@@ -561,7 +600,7 @@ bool HttpServer::run() {
                 doc_root_,
                 std::ref(parser_),
                 std::ref(indexer_),
-                std::ref(mutex_),
+                scheduler_,
                 dev_path_
             ).detach();
         }
