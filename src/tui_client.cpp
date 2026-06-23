@@ -62,8 +62,8 @@ std::string event_to_string(const Event& event) {
 
 } // namespace
 
-TuiClient::TuiClient(NtfsParser& parser, NtfsIndexer& indexer, const std::string& dev_path)
-    : parser_(parser), indexer_(indexer), dev_path_(dev_path) {}
+TuiClient::TuiClient(NtfsParser& parser, NtfsIndexer& indexer, const std::string& dev_path, const std::string& cache_file)
+    : parser_(parser), indexer_(indexer), dev_path_(dev_path), cache_file_(cache_file) {}
 
 void TuiClient::run() {
     LOG(INFO) << "TuiClient::run() entered.";
@@ -595,26 +595,53 @@ void TuiClient::run() {
                 LOG(INFO) << "Starting MFT metadata parse...";
                 if (!parser_.parse()) {
                     scan_phase = ScanPhase::Failed;
-                    scan_error_msg = "Failed to parse metadata and runs of $MFT.";
+                scan_error_msg = "Failed to parse metadata and runs of $MFT.";
                     screen.PostEvent(Event::Custom);
                     return;
                 }
 
-                scan_phase = ScanPhase::BuildingIndex;
-                screen.PostEvent(Event::Custom);
+                bool loaded_from_cache = false;
+                if (!cache_file_.empty()) {
+                    LOG(INFO) << fmt::format("Attempting to load index from cache file: {} ...", cache_file_);
+                    if (indexer_.load_from_cache(cache_file_)) {
+                        LOG(INFO) << "Successfully loaded index from cache. Applying pending USN Change Journal entries to catch up...";
+                        if (!indexer_.update_index_incremental(parser_)) {
+                            LOG(WARNING) << "Failed to perform incremental catch-up (USN journal may have been truncated or is disabled). Discarding cache and rebuilding index...";
+                        } else {
+                            LOG(INFO) << "Catch-up successful. Index is up to date.";
+                            loaded_from_cache = true;
+                        }
+                    } else {
+                        LOG(WARNING) << "Failed to load index from cache (or cache file does not exist). Proceeding with full scan.";
+                    }
+                }
 
-                LOG(INFO) << "Building initial file index...";
-                bool index_built = indexer_.build_initial_index(parser_, [&](uint64_t processed, uint64_t total) {
-                    scan_progress = processed;
-                    scan_total = total;
+                if (!loaded_from_cache) {
+                    scan_phase = ScanPhase::BuildingIndex;
                     screen.PostEvent(Event::Custom);
-                });
 
-                if (!index_built) {
-                    scan_phase = ScanPhase::Failed;
-                    scan_error_msg = "Failed to scan MFT records or resolve parent paths.";
-                    screen.PostEvent(Event::Custom);
-                    return;
+                    LOG(INFO) << "Building initial file index...";
+                    bool index_built = indexer_.build_initial_index(parser_, [&](uint64_t processed, uint64_t total) {
+                        scan_progress = processed;
+                        scan_total = total;
+                        screen.PostEvent(Event::Custom);
+                    });
+
+                    if (!index_built) {
+                        scan_phase = ScanPhase::Failed;
+                        scan_error_msg = "Failed to scan MFT records or resolve parent paths.";
+                        screen.PostEvent(Event::Custom);
+                        return;
+                    }
+
+                    if (!cache_file_.empty()) {
+                        LOG(INFO) << fmt::format("Saving built index to cache file: {} ...", cache_file_);
+                        if (indexer_.save_to_cache(cache_file_)) {
+                            LOG(INFO) << "Successfully saved index to cache.";
+                        } else {
+                            LOG(ERROR) << "Failed to save index to cache.";
+                        }
+                    }
                 }
 
                 // Populate all cached files on background thread before transitioning

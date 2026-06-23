@@ -89,3 +89,47 @@ TEST_CASE("Resolve all paths test", "[ntfs]") {
     REQUIRE_NOTHROW(resolved.at(300).full_path);
     REQUIRE_NOTHROW(resolved.at(301).full_path);
 }
+
+#include <filesystem>
+
+TEST_CASE("Cache save and load test", "[cache]") {
+    NtfsIndexer indexer;
+    
+    std::unordered_map<uint64_t, FileEntry> mock_files;
+    mock_files[5] = FileEntry{5, 5, "root", true, 0, "/"};
+    mock_files[100] = FileEntry{100, 5, "DirA", true, 0, "/DirA"};
+    mock_files[101] = FileEntry{101, 100, "FileB.txt", false, 1234, "/DirA/FileB.txt"};
+    
+    indexer.test_set_files(mock_files);
+    indexer.test_set_last_usn(0x123456789ABCDEF0ULL);
+    
+    const std::string cache_path = "test_cache.bin";
+    
+    // Clean up potentially pre-existing test file
+    std::filesystem::remove(cache_path);
+    
+    SECTION("Save cache") {
+        REQUIRE(indexer.save_to_cache(cache_path) == true);
+        REQUIRE(std::filesystem::exists(cache_path) == true);
+    }
+    
+    SECTION("Load cache") {
+        REQUIRE(indexer.save_to_cache(cache_path) == true);
+        
+        NtfsIndexer loaded_indexer;
+        REQUIRE(loaded_indexer.load_from_cache(cache_path) == true);
+        
+        REQUIRE(loaded_indexer.get_last_usn() == 0x123456789ABCDEF0ULL);
+        const auto& loaded_files = loaded_indexer.get_files();
+        REQUIRE(loaded_files.size() == 3);
+        REQUIRE(loaded_files.at(5).name == "root");
+        REQUIRE(loaded_files.at(100).name == "DirA");
+        REQUIRE(loaded_files.at(101).name == "FileB.txt");
+        REQUIRE(loaded_files.at(101).size == 1234);
+        REQUIRE(loaded_files.at(101).full_path == "/DirA/FileB.txt");
+    }
+    
+    // Clean up
+    std::filesystem::remove(cache_path);
+}
+

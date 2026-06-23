@@ -692,8 +692,8 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
     uint64_t curr_offset = active_offset;
     if (start_usn > 0) {
         if (start_usn < active_offset) {
-            LOG(INFO) << fmt::format("[USN Parse] start_usn 0x{:X} is older than active offset 0x{:X}. Journal was truncated.", start_usn, active_offset);
-            curr_offset = active_offset;
+            LOG(WARNING) << fmt::format("[USN Parse] start_usn 0x{:X} is older than active offset 0x{:X}. Journal was truncated. Incremental update is invalid.", start_usn, active_offset);
+            return false;
         } else if (start_usn > j_stream_size) {
             LOG(INFO) << fmt::format("[USN Parse] start_usn 0x{:X} is beyond stream size 0x{:X}.", start_usn, j_stream_size);
             curr_offset = j_stream_size;

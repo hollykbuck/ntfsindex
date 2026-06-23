@@ -134,6 +134,7 @@ struct AppConfig {
     std::string address = "0.0.0.0";
     std::string doc_root = "./web";
     uint32_t auto_update_interval = 0;
+    std::string cache_file = "";
 };
 
 } // namespace
@@ -145,6 +146,7 @@ ABSL_FLAG(std::string, address, "0.0.0.0", "IP address to bind the HTTP server t
 ABSL_FLAG(std::string, doc_root, "./web", "Document root directory serving frontend assets");
 ABSL_FLAG(bool, tui, false, "Start in interactive TUI mode instead of HTTP Server");
 ABSL_FLAG(uint32_t, auto_update_interval, 0, "Interval in seconds for automatic incremental updates (0 to disable)");
+ABSL_FLAG(std::string, cache_file, "", "Path to the cache file (empty to disable caching)");
 
 int main(int argc, char* argv[]) {
     // Initialize Abseil Program Usage and Parse CommandLine
@@ -173,6 +175,7 @@ int main(int argc, char* argv[]) {
     config.address = absl::GetFlag(FLAGS_address);
     config.doc_root = absl::GetFlag(FLAGS_doc_root);
     config.auto_update_interval = absl::GetFlag(FLAGS_auto_update_interval);
+    config.cache_file = absl::GetFlag(FLAGS_cache_file);
 
     LOG(INFO) << "---------------------------------------------";
     LOG(INFO) << "[Server Config Options]";
@@ -181,6 +184,7 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << fmt::format("  - Listen Port:     {}", config.port);
     LOG(INFO) << fmt::format("  - Frontend Root:   {}", config.doc_root);
     LOG(INFO) << fmt::format("  - Auto Update:     {}s", config.auto_update_interval == 0 ? "Disabled" : std::to_string(config.auto_update_interval));
+    LOG(INFO) << fmt::format("  - Cache File:      {}", config.cache_file.empty() ? "Disabled" : config.cache_file);
     LOG(INFO) << "---------------------------------------------";
 
     exec::single_thread_context worker_ctx;
@@ -194,7 +198,7 @@ int main(int argc, char* argv[]) {
     NtfsIndexer indexer;
 
     if (absl::GetFlag(FLAGS_tui)) {
-        TuiClient tui(parser, indexer, config.device_path);
+        TuiClient tui(parser, indexer, config.device_path, config.cache_file);
         tui.run();
     } else {
         auto init_sender = stdexec::schedule(scheduler)
@@ -210,10 +214,37 @@ int main(int argc, char* argv[]) {
                     return false;
                 }
 
-                LOG(INFO) << "Building initial file index...";
-                if (!indexer.build_initial_index(parser)) {
-                    LOG(ERROR) << "Error: Index build failed.";
-                    return false;
+                bool loaded_from_cache = false;
+                if (!config.cache_file.empty()) {
+                    LOG(INFO) << fmt::format("Attempting to load index from cache file: {} ...", config.cache_file);
+                    if (indexer.load_from_cache(config.cache_file)) {
+                        LOG(INFO) << "Successfully loaded index from cache. Applying pending USN Change Journal entries to catch up...";
+                        if (!indexer.update_index_incremental(parser)) {
+                            LOG(WARNING) << "Failed to perform incremental catch-up (USN journal may have been truncated or is disabled). Discarding cache and rebuilding index...";
+                        } else {
+                            LOG(INFO) << "Catch-up successful. Index is up to date.";
+                            loaded_from_cache = true;
+                        }
+                    } else {
+                        LOG(WARNING) << "Failed to load index from cache (or cache file does not exist). Proceeding with full scan.";
+                    }
+                }
+
+                if (!loaded_from_cache) {
+                    LOG(INFO) << "Building initial file index...";
+                    if (!indexer.build_initial_index(parser)) {
+                        LOG(ERROR) << "Error: Index build failed.";
+                        return false;
+                    }
+
+                    if (!config.cache_file.empty()) {
+                        LOG(INFO) << fmt::format("Saving built index to cache file: {} ...", config.cache_file);
+                        if (indexer.save_to_cache(config.cache_file)) {
+                            LOG(INFO) << "Successfully saved index to cache.";
+                        } else {
+                            LOG(ERROR) << "Failed to save index to cache.";
+                        }
+                    }
                 }
 
                 return true;
@@ -225,6 +256,8 @@ int main(int argc, char* argv[]) {
         }
 
         indexer.print_stats(config.device_path);
+
+
 
         HttpServer server(parser, indexer, scheduler, io_scheduler, config.address, config.port, config.doc_root, config.device_path, config.auto_update_interval);
         if (!server.run()) {

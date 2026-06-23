@@ -72,6 +72,7 @@ target_link_libraries(ntfs_tests PRIVATE
     absl::log_initialize
     STDEXEC::stdexec
     STDEXEC::asioexec
+    nlohmann_json::nlohmann_json
 )
 if(MSVC)
     target_compile_options(ntfs_tests PRIVATE /W4)

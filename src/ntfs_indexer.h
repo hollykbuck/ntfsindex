@@ -17,6 +17,10 @@ public:
     // Perform an incremental update based on USN Change Journal
     bool update_index_incremental(NtfsParser& parser);
 
+    // Save and load cached index to/from disk
+    bool save_to_cache(const std::string& cache_path) const;
+    bool load_from_cache(const std::string& cache_path);
+
     // Get the in-memory files map
     const std::unordered_map<uint64_t, FileEntry>& get_files() const { return files_; }
 
@@ -28,6 +32,7 @@ public:
 
     // Direct tree manipulation helpers for testing
     void test_set_files(const std::unordered_map<uint64_t, FileEntry>& files) { files_ = files; }
+    void test_set_last_usn(uint64_t usn) { last_usn_ = usn; }
     void test_resolve_all_paths() { resolve_all_paths(); }
 
 private:

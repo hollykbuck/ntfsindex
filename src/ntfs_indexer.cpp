@@ -5,6 +5,28 @@
 #include <unordered_map>
 #include <algorithm>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
+#include <fstream>
+
+void to_json(nlohmann::json& j, const FileEntry& e) {
+    j = nlohmann::json{
+        {"id", e.id},
+        {"parent_id", e.parent_id},
+        {"name", e.name},
+        {"is_directory", e.is_directory},
+        {"size", e.size},
+        {"full_path", e.full_path}
+    };
+}
+
+void from_json(const nlohmann::json& j, FileEntry& e) {
+    j.at("id").get_to(e.id);
+    j.at("parent_id").get_to(e.parent_id);
+    j.at("name").get_to(e.name);
+    j.at("is_directory").get_to(e.is_directory);
+    j.at("size").get_to(e.size);
+    j.at("full_path").get_to(e.full_path);
+}
 
 namespace {
 std::string format_size(uint64_t bytes) {
@@ -228,4 +250,57 @@ void NtfsIndexer::print_stats(const std::string& dev_path) const {
     LOG(INFO) << fmt::format("Total Files:         {}", file_count);
     LOG(INFO) << fmt::format("Total Logical Size:  {} ({})", total_bytes, format_size(total_bytes));
     LOG(INFO) << "======================================================";
+}
+
+bool NtfsIndexer::save_to_cache(const std::string& cache_path) const {
+    try {
+        std::ofstream os(cache_path, std::ios::binary);
+        if (!os.is_open()) {
+            LOG(ERROR) << "[Cache] Failed to open cache file for writing: " << cache_path;
+            return false;
+        }
+        
+        nlohmann::json j;
+        j["last_usn"] = last_usn_;
+        j["files"] = files_;
+        
+        std::vector<uint8_t> msgpack = nlohmann::json::to_msgpack(j);
+        os.write(reinterpret_cast<const char*>(msgpack.data()), msgpack.size());
+        return true;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "[Cache] Exception while saving cache: " << e.what();
+        return false;
+    } catch (...) {
+        LOG(ERROR) << "[Cache] Unknown exception while saving cache.";
+        return false;
+    }
+}
+
+bool NtfsIndexer::load_from_cache(const std::string& cache_path) {
+    try {
+        std::ifstream is(cache_path, std::ios::binary | std::ios::ate);
+        if (!is.is_open()) {
+            return false;
+        }
+        
+        std::streamsize size = is.tellg();
+        is.seekg(0, std::ios::beg);
+        
+        std::vector<uint8_t> buffer(size);
+        if (!is.read(reinterpret_cast<char*>(buffer.data()), size)) {
+            LOG(ERROR) << "[Cache] Failed to read cache file content: " << cache_path;
+            return false;
+        }
+        
+        nlohmann::json j = nlohmann::json::from_msgpack(buffer);
+        last_usn_ = j.at("last_usn").get<uint64_t>();
+        files_ = j.at("files").get<std::unordered_map<uint64_t, FileEntry>>();
+        return true;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "[Cache] Exception while loading cache: " << e.what();
+        return false;
+    } catch (...) {
+        LOG(ERROR) << "[Cache] Unknown exception while loading cache.";
+        return false;
+    }
 }
