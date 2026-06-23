@@ -89,6 +89,11 @@ void TuiClient::run() {
     std::string regex_error = "";
     bool bg_results_ready = false;
 
+    // Loading and query duration state
+    bool is_searching = false;
+    double search_duration_ms = 0.0;
+    double bg_search_duration_ms = 0.0;
+
     // Cache pointers to all files in the index
     std::vector<const FileEntry*> all_files;
 
@@ -171,6 +176,11 @@ void TuiClient::run() {
         if (scan_phase.load() != ScanPhase::Completed) {
             return;
         }
+
+        // Set searching state and trigger immediate screen refresh
+        is_searching = true;
+        screen.PostEvent(Event::Custom);
+
         uint64_t my_id = ++search_id;
         std::string query_to_run = search_query;
         int current_type_filter = type_filter;
@@ -185,6 +195,8 @@ void TuiClient::run() {
                     if (my_id != search_id.load()) {
                         return;
                     }
+
+                    auto start_time = std::chrono::high_resolution_clock::now();
 
                     std::vector<const FileEntry*> temp_filtered;
                     std::vector<std::string> temp_names;
@@ -206,6 +218,7 @@ void TuiClient::run() {
                                 bg_filtered_files.clear();
                                 bg_file_names.clear();
                                 bg_regex_error = "Invalid Regular Expression";
+                                bg_search_duration_ms = 0.0;
                                 bg_results_ready = true;
                                 screen.PostEvent(Event::Custom);
                             }
@@ -242,20 +255,42 @@ void TuiClient::run() {
                         }
                     }
 
+                    auto end_time = std::chrono::high_resolution_clock::now();
+                    double duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count() / 1000.0;
+
                     {
                         std::lock_guard<std::mutex> lock(search_mutex);
                         if (my_id == search_id.load()) {
                             bg_filtered_files = std::move(temp_filtered);
                             bg_file_names = std::move(temp_names);
                             bg_regex_error = "";
+                            bg_search_duration_ms = duration;
                             bg_results_ready = true;
                             screen.PostEvent(Event::Custom);
                         }
                     }
                 } catch (const std::exception& e) {
                     LOG(ERROR) << "Exception in search task: " << e.what();
+                    std::lock_guard<std::mutex> lock(search_mutex);
+                    if (my_id == search_id.load()) {
+                        bg_filtered_files.clear();
+                        bg_file_names.clear();
+                        bg_regex_error = std::string("Error: ") + e.what();
+                        bg_search_duration_ms = 0.0;
+                        bg_results_ready = true;
+                        screen.PostEvent(Event::Custom);
+                    }
                 } catch (...) {
                     LOG(ERROR) << "Unknown exception in search task.";
+                    std::lock_guard<std::mutex> lock(search_mutex);
+                    if (my_id == search_id.load()) {
+                        bg_filtered_files.clear();
+                        bg_file_names.clear();
+                        bg_regex_error = "Unknown error during search.";
+                        bg_search_duration_ms = 0.0;
+                        bg_results_ready = true;
+                        screen.PostEvent(Event::Custom);
+                    }
                 }
             })
             | stdexec::upon_error([](std::exception_ptr) {
@@ -403,6 +438,18 @@ void TuiClient::run() {
                 error_element = text(fmt::format(" [{}]", regex_error)) | bold | color(Color::Red);
             }
 
+            std::string results_title;
+            if (is_searching) {
+                results_title = " Search Results (Loading...) ";
+            } else if (search_query.empty()) {
+                results_title = fmt::format(" Search Results ({} files) ", filtered_files.size());
+            } else {
+                results_title = fmt::format(" Search Results ({} matched in {:.2f} ms) ", filtered_files.size(), search_duration_ms);
+            }
+
+            Element results_window = window(text(results_title) | (is_searching ? color(Color::Yellow) : color(Color::Blue)),
+                                            file_list->Render() | vscroll_indicator | frame) | flex;
+
             return vbox({
                 // Header bar
                 hbox({
@@ -438,8 +485,7 @@ void TuiClient::run() {
                 
                 // Results list and details panel split
                 hbox({
-                    window(text(fmt::format(" Search Results ({}) ", filtered_files.size())), 
-                           file_list->Render() | vscroll_indicator | frame) | flex,
+                    results_window,
                     window(text(" Properties "), vbox(std::move(details))) | size(WIDTH, EQUAL, 60)
                 }) | flex,
                 
@@ -510,6 +556,8 @@ void TuiClient::run() {
                     filtered_files = std::move(bg_filtered_files);
                     file_names = std::move(bg_file_names);
                     regex_error = std::move(bg_regex_error);
+                    search_duration_ms = bg_search_duration_ms;
+                    is_searching = false;
                     bg_results_ready = false;
                 }
                 return true;
@@ -562,6 +610,8 @@ void TuiClient::run() {
                 filtered_files = std::move(bg_filtered_files);
                 file_names = std::move(bg_file_names);
                 regex_error = std::move(bg_regex_error);
+                search_duration_ms = bg_search_duration_ms;
+                is_searching = false;
                 bg_results_ready = false;
                 
                 if (selected_index >= static_cast<int>(filtered_files.size())) {
