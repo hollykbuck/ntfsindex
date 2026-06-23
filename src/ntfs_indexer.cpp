@@ -71,6 +71,7 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
     std::vector<NtfsParser::UsnJournalEntry> entries;
     uint64_t next_usn = last_usn_;
     if (!parser.parse_usn_journal(entries, usn_mft_idx, last_usn_, &next_usn)) {
+        LOG(ERROR) << "[Indexer] Error: Failed to parse USN Journal during incremental update.";
         return false;
     }
 

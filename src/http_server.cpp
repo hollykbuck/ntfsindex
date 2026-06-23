@@ -138,13 +138,36 @@ std::string to_lowercase(const std::string& str) {
     return lower;
 }
 
+class AccessLogGuard {
+ public:
+    AccessLogGuard(std::string method, std::string target, std::string client_ip)
+        : method_(std::move(method)), target_(std::move(target)), client_ip_(std::move(client_ip)),
+          start_(std::chrono::high_resolution_clock::now()) {
+        LOG(INFO) << fmt::format("[Access Log] HTTP {} {} (Request received from {})", method_, target_, client_ip_);
+    }
+    ~AccessLogGuard() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start_).count();
+        LOG(INFO) << fmt::format("[Access Log] HTTP {} {} -> Completed in {} ms for {}", method_, target_, elapsed, client_ip_);
+    }
+
+ private:
+    std::string method_;
+    std::string target_;
+    std::string client_ip_;
+    std::chrono::high_resolution_clock::time_point start_;
+};
+
 // Produce an HTTP response for the request
 template<class Body, class Allocator>
 http::message_generator
 handle_request(
     http::request<Body, http::basic_fields<Allocator>>&& req,
-    const HttpContext& ctx)
+    const HttpContext& ctx,
+    const std::string& client_ip)
 {
+    AccessLogGuard log_guard(std::string(req.method_string()), std::string(req.target()), client_ip);
+
     auto& parser = ctx.parser;
     auto& indexer = ctx.indexer;
     auto scheduler = ctx.worker_scheduler;
@@ -557,9 +580,14 @@ void do_session(tcp::socket socket, const HttpContext& ctx, exec::async_scope& s
         tcp::socket socket;
         beast::flat_buffer buffer;
         http::request<http::string_body> req;
+        std::string client_ip;
     };
     
-    auto s = std::make_shared<Session>(Session{std::move(socket), {}, {}});
+    boost::system::error_code ec;
+    auto remote = socket.remote_endpoint(ec);
+    std::string client_ip = ec ? "unknown" : fmt::format("{}:{}", remote.address().to_string(), remote.port());
+    
+    auto s = std::make_shared<Session>(Session{std::move(socket), {}, {}, client_ip});
     
     auto run_cycle = std::make_shared<std::function<void()>>();
     *run_cycle = [s, ctx, &scope, run_cycle]() {
@@ -570,7 +598,7 @@ void do_session(tcp::socket socket, const HttpContext& ctx, exec::async_scope& s
             | stdexec::let_value([s](std::size_t) mutable {
                 return read_context()
                     | stdexec::then([s](const HttpContext& read_ctx) mutable {
-                        auto msg = handle_request(std::move(s->req), read_ctx);
+                        auto msg = handle_request(std::move(s->req), read_ctx, s->client_ip);
                         bool keep_alive = msg.keep_alive();
                         return std::make_pair(std::move(msg), keep_alive);
                     });

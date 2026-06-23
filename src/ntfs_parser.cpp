@@ -496,6 +496,7 @@ bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
 
 bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t usn_mft_idx, uint64_t start_usn, uint64_t* next_usn) {
     if (usn_mft_idx == 0) {
+        LOG(WARNING) << "[USN Parse] USN MFT index is 0. USN Change Journal ($UsnJrnl) is not active or could not be found on this volume.";
         return false;
     }
 
@@ -760,6 +761,8 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
     if (next_usn) {
         *next_usn = curr_offset;
     }
+
+    LOG(INFO) << fmt::format("[USN Parse] Successfully parsed {} USN journal entries. Next USN: 0x{:X}", entries.size(), curr_offset);
 
     return true;
 }
