@@ -34,13 +34,40 @@ std::string format_bytes(uint64_t bytes) {
     return fmt::format("{:.2f} {}", s, suffixes[i]);
 }
 
+std::string event_to_string(const Event& event) {
+    if (event.is_character()) {
+        std::string s = "Char(";
+        for (char c : event.character()) {
+            if (c < 32) s += fmt::format("\\x{:02X}", static_cast<int>(c));
+            else s += c;
+        }
+        s += ")";
+        return s;
+    }
+    if (event == Event::Custom) return "Custom";
+    if (event == Event::Escape) return "Escape";
+    if (event == Event::F1) return "F1";
+    if (event == Event::F2) return "F2";
+    if (event == Event::F3) return "F3";
+    if (event == Event::F4) return "F4";
+    if (event == Event::F5) return "F5";
+    if (event == Event::F6) return "F6";
+    if (event == Event::F7) return "F7";
+    if (event == Event::F8) return "F8";
+    if (event == Event::F9) return "F9";
+    if (event == Event::F10) return "F10";
+    return "Special/Unknown";
+}
+
 } // namespace
 
 TuiClient::TuiClient(NtfsParser& parser, NtfsIndexer& indexer, const std::string& dev_path)
     : parser_(parser), indexer_(indexer), dev_path_(dev_path) {}
 
 void TuiClient::run() {
+    LOG(INFO) << "TuiClient::run() entered.";
     auto screen = ScreenInteractive::Fullscreen();
+    screen.TrackMouse(false);
 
     std::string search_query = "";
     std::vector<const FileEntry*> filtered_files;
@@ -111,10 +138,10 @@ void TuiClient::run() {
     int active_tab = 0;
     std::vector<std::string> tab_names = {"Search Files", "System Logs"};
     
-    Component tab_toggle = Toggle(&tab_names, &active_tab);
-    tab_toggle = tab_toggle | CatchEvent([&](Event event) {
+    Component raw_tab_toggle = Toggle(&tab_names, &active_tab);
+    Component tab_toggle = raw_tab_toggle | CatchEvent([raw_tab_toggle, &active_tab, &refresh_logs](Event event) {
         int old_val = active_tab;
-        bool handled = tab_toggle->OnEvent(event);
+        bool handled = raw_tab_toggle->OnEvent(event);
         if (active_tab != old_val) {
             if (active_tab == 1) {
                 refresh_logs();
@@ -144,79 +171,91 @@ void TuiClient::run() {
 
         auto search_sender = stdexec::schedule(search_scheduler)
             | stdexec::then([&, my_id, query = std::move(query_to_run), current_type_filter, current_use_regex]() {
-                // Debounce delay
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                
-                if (my_id != search_id.load()) {
-                    return;
-                }
-
-                std::vector<const FileEntry*> temp_filtered;
-                std::vector<std::string> temp_names;
-                bool regex_valid = true;
-                std::regex pattern;
-
-                if (current_use_regex && !query.empty()) {
-                    try {
-                        pattern = std::regex(query, std::regex_constants::ECMAScript | std::regex_constants::icase);
-                    } catch (const std::regex_error&) {
-                        regex_valid = false;
+                try {
+                    // Debounce delay
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    
+                    if (my_id != search_id.load()) {
+                        return;
                     }
-                }
 
-                if (!regex_valid) {
+                    std::vector<const FileEntry*> temp_filtered;
+                    std::vector<std::string> temp_names;
+                    bool regex_valid = true;
+                    std::regex pattern;
+
+                    if (current_use_regex && !query.empty()) {
+                        try {
+                            pattern = std::regex(query, std::regex_constants::ECMAScript | std::regex_constants::icase);
+                        } catch (const std::regex_error&) {
+                            regex_valid = false;
+                        }
+                    }
+
+                    if (!regex_valid) {
+                        {
+                            std::lock_guard<std::mutex> lock(search_mutex);
+                            if (my_id == search_id.load()) {
+                                bg_filtered_files.clear();
+                                bg_file_names.clear();
+                                bg_regex_error = "Invalid Regular Expression";
+                                bg_results_ready = true;
+                                screen.PostEvent(Event::Custom);
+                            }
+                        }
+                        return;
+                    }
+
+                    std::string query_lower = query;
+                    std::transform(query_lower.begin(), query_lower.end(), query_lower.begin(), ::tolower);
+
+                    for (const auto* file : all_files) {
+                        if (current_type_filter == 1 && file->is_directory) continue;
+                        if (current_type_filter == 2 && !file->is_directory) continue;
+
+                        bool match = false;
+                        if (query.empty()) {
+                            match = true;
+                        } else if (current_use_regex) {
+                            match = std::regex_search(file->full_path, pattern);
+                        } else {
+                            std::string path_lower = file->full_path;
+                            std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(), ::tolower);
+                            match = (path_lower.find(query_lower) != std::string::npos);
+                        }
+
+                        if (match) {
+                            temp_filtered.push_back(file);
+                            std::string prefix = file->is_directory ? "[DIR]  " : "[FILE] ";
+                            temp_names.push_back(prefix + file->full_path);
+
+                            if (temp_filtered.size() >= 500) {
+                                break;
+                            }
+                        }
+                    }
+
                     {
                         std::lock_guard<std::mutex> lock(search_mutex);
                         if (my_id == search_id.load()) {
-                            bg_filtered_files.clear();
-                            bg_file_names.clear();
-                            bg_regex_error = "Invalid Regular Expression";
+                            bg_filtered_files = std::move(temp_filtered);
+                            bg_file_names = std::move(temp_names);
+                            bg_regex_error = "";
                             bg_results_ready = true;
                             screen.PostEvent(Event::Custom);
                         }
                     }
-                    return;
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "Exception in search task: " << e.what();
+                } catch (...) {
+                    LOG(ERROR) << "Unknown exception in search task.";
                 }
-
-                std::string query_lower = query;
-                std::transform(query_lower.begin(), query_lower.end(), query_lower.begin(), ::tolower);
-
-                for (const auto* file : all_files) {
-                    if (current_type_filter == 1 && file->is_directory) continue;
-                    if (current_type_filter == 2 && !file->is_directory) continue;
-
-                    bool match = false;
-                    if (query.empty()) {
-                        match = true;
-                    } else if (current_use_regex) {
-                        match = std::regex_search(file->full_path, pattern);
-                    } else {
-                        std::string path_lower = file->full_path;
-                        std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(), ::tolower);
-                        match = (path_lower.find(query_lower) != std::string::npos);
-                    }
-
-                    if (match) {
-                        temp_filtered.push_back(file);
-                        std::string prefix = file->is_directory ? "[DIR]  " : "[FILE] ";
-                        temp_names.push_back(prefix + file->full_path);
-
-                        if (temp_filtered.size() >= 500) {
-                            break;
-                        }
-                    }
-                }
-
-                {
-                    std::lock_guard<std::mutex> lock(search_mutex);
-                    if (my_id == search_id.load()) {
-                        bg_filtered_files = std::move(temp_filtered);
-                        bg_file_names = std::move(temp_names);
-                        bg_regex_error = "";
-                        bg_results_ready = true;
-                        screen.PostEvent(Event::Custom);
-                    }
-                }
+            })
+            | stdexec::upon_error([](std::exception_ptr) {
+                LOG(ERROR) << "Search task failed with unhandled sender error.";
+            })
+            | stdexec::upon_stopped([]() {
+                LOG(INFO) << "Search task was stopped.";
             });
 
         scope.spawn(std::move(search_sender));
@@ -228,20 +267,20 @@ void TuiClient::run() {
     };
     Component input_field = Input(&search_query, "Type to search by name or path...", input_opt);
 
-    Component regex_checkbox = Checkbox("Use Regex (F2)", &use_regex);
-    regex_checkbox = regex_checkbox | CatchEvent([&](Event event) {
+    Component raw_regex_checkbox = Checkbox("Use Regex (F2)", &use_regex);
+    Component regex_checkbox = raw_regex_checkbox | CatchEvent([raw_regex_checkbox, &use_regex, &trigger_search](Event event) {
         bool old_val = use_regex;
-        bool handled = regex_checkbox->OnEvent(event);
+        bool handled = raw_regex_checkbox->OnEvent(event);
         if (use_regex != old_val) {
             trigger_search();
         }
         return handled;
     });
 
-    Component type_toggle = Toggle(&type_filter_names, &type_filter);
-    type_toggle = type_toggle | CatchEvent([&](Event event) {
+    Component raw_type_toggle = Toggle(&type_filter_names, &type_filter);
+    Component type_toggle = raw_type_toggle | CatchEvent([raw_type_toggle, &type_filter, &trigger_search](Event event) {
         int old_val = type_filter;
-        bool handled = type_toggle->OnEvent(event);
+        bool handled = raw_type_toggle->OnEvent(event);
         if (type_filter != old_val) {
             trigger_search();
         }
@@ -299,14 +338,14 @@ void TuiClient::run() {
                 body.push_back(separator());
                 body.push_back(text(scan_error_msg) | color(Color::Red) | hcenter);
                 body.push_back(separator());
-                body.push_back(text("Press ESC to exit.") | dim | hcenter);
+                body.push_back(text("Press Ctrl+Q to exit.") | dim | hcenter);
             }
 
             return vbox({
                 hbox({
                     text(" NTFS Indexer Terminal UI ") | bold | bgcolor(Color::Blue) | color(Color::White),
                     filler(),
-                    text(" ESC to exit ") | dim
+                    text(" Ctrl+Q to exit ") | dim
                 }),
                 separator(),
                 filler(),
@@ -342,7 +381,7 @@ void TuiClient::run() {
                 hbox({
                     text(" NTFS Indexer Terminal UI ") | bold | bgcolor(Color::Blue) | color(Color::White),
                     filler(),
-                    text(" Use Tab to focus fields | Up/Down to navigate | ESC to exit ") | dim
+                    text(" Use Tab to focus fields | Up/Down to navigate | Ctrl+Q to exit ") | dim
                 }),
                 separator(),
                 
@@ -377,7 +416,7 @@ void TuiClient::run() {
                 // Footer
                 separator(),
                 hbox({
-                    text(" F2/Ctrl+R: Regex | F3/Ctrl+F: Files | F4/Ctrl+D: Dirs | F5/Ctrl+A: All Filter | F6/Ctrl+L: Tab | ESC: Exit ") | dim
+                    text(" F2/Ctrl+R: Regex | F3/Ctrl+F: Files | F4/Ctrl+D: Dirs | F5/Ctrl+A: All Filter | F6/Ctrl+L: Tab | Ctrl+Q: Exit ") | dim
                 })
             });
         } else {
@@ -386,7 +425,7 @@ void TuiClient::run() {
                 hbox({
                     text(" NTFS Indexer Terminal UI ") | bold | bgcolor(Color::Blue) | color(Color::White),
                     filler(),
-                    text(" Use Tab to focus fields | Up/Down to navigate | ESC to exit ") | dim
+                    text(" Use Tab to focus fields | Up/Down to navigate | Ctrl+Q to exit ") | dim
                 }),
                 separator(),
                 
@@ -412,7 +451,7 @@ void TuiClient::run() {
                 // Footer
                 separator(),
                 hbox({
-                    text(" F5/Ctrl+G: Refresh Logs | F6/Ctrl+L: Tab | ESC: Exit ") | dim
+                    text(" F5/Ctrl+G: Refresh Logs | F6/Ctrl+L: Tab | Ctrl+Q: Exit ") | dim
                 })
             });
         }
@@ -426,7 +465,9 @@ void TuiClient::run() {
     };
 
     auto catch_exit = CatchEvent(renderer, [&](Event event) {
-        if (event == Event::Escape) {
+        LOG(INFO) << "TuiClient: CatchEvent received event: " << event_to_string(event);
+        if (event == Event::F10 || is_ctrl_key(event, 'Q')) {
+            LOG(INFO) << "TuiClient: Matched exit hotkey (F10 or Ctrl+Q). Triggering exit.";
             screen.ExitLoopClosure()();
             return true;
         }
@@ -443,7 +484,7 @@ void TuiClient::run() {
                 }
                 return true;
             }
-            return false;
+            return true;
         }
 
         // Tab Switch: F6 or Ctrl+L
@@ -509,74 +550,103 @@ void TuiClient::run() {
 
     auto scan_sender = stdexec::schedule(scan_scheduler)
         | stdexec::then([&]() {
-            scan_phase = ScanPhase::ParsingMFT;
-            screen.PostEvent(Event::Custom);
-
-            LOG(INFO) << fmt::format("Initializing parser for device: {} ...", dev_path_);
-            if (!parser_.init(dev_path_)) {
-                scan_phase = ScanPhase::Failed;
-                scan_error_msg = fmt::format("Failed to initialize device / block file: {}", dev_path_);
+            try {
+                scan_phase = ScanPhase::ParsingMFT;
                 screen.PostEvent(Event::Custom);
-                return;
-            }
 
-            LOG(INFO) << "Starting MFT metadata parse...";
-            if (!parser_.parse()) {
-                scan_phase = ScanPhase::Failed;
-                scan_error_msg = "Failed to parse metadata and runs of $MFT.";
-                screen.PostEvent(Event::Custom);
-                return;
-            }
-
-            scan_phase = ScanPhase::BuildingIndex;
-            screen.PostEvent(Event::Custom);
-
-            LOG(INFO) << "Building initial file index...";
-            bool index_built = indexer_.build_initial_index(parser_, [&](uint64_t processed, uint64_t total) {
-                scan_progress = processed;
-                scan_total = total;
-                screen.PostEvent(Event::Custom);
-            });
-
-            if (!index_built) {
-                scan_phase = ScanPhase::Failed;
-                scan_error_msg = "Failed to scan MFT records or resolve parent paths.";
-                screen.PostEvent(Event::Custom);
-                return;
-            }
-
-            // Populate all cached files on background thread before transitioning
-            std::vector<const FileEntry*> temp_all_files;
-            temp_all_files.reserve(indexer_.get_files().size());
-            for (const auto& [id, entry] : indexer_.get_files()) {
-                temp_all_files.push_back(&entry);
-            }
-            std::sort(temp_all_files.begin(), temp_all_files.end(), [](const FileEntry* a, const FileEntry* b) {
-                return a->full_path < b->full_path;
-            });
-
-            {
-                std::lock_guard<std::mutex> lock(search_mutex);
-                all_files = std::move(temp_all_files);
-                
-                // Populate initial search view
-                bg_filtered_files.clear();
-                bg_file_names.clear();
-                for (size_t i = 0; i < std::min<size_t>(200, all_files.size()); ++i) {
-                    bg_filtered_files.push_back(all_files[i]);
-                    std::string prefix = all_files[i]->is_directory ? "[DIR]  " : "[FILE] ";
-                    bg_file_names.push_back(prefix + all_files[i]->full_path);
+                LOG(INFO) << fmt::format("Initializing parser for device: {} ...", dev_path_);
+                if (!parser_.init(dev_path_)) {
+                    scan_phase = ScanPhase::Failed;
+                    scan_error_msg = fmt::format("Failed to initialize device / block file: {}", dev_path_);
+                    screen.PostEvent(Event::Custom);
+                    return;
                 }
-                bg_results_ready = true;
-                scan_phase = ScanPhase::Completed;
+
+                LOG(INFO) << "Starting MFT metadata parse...";
+                if (!parser_.parse()) {
+                    scan_phase = ScanPhase::Failed;
+                    scan_error_msg = "Failed to parse metadata and runs of $MFT.";
+                    screen.PostEvent(Event::Custom);
+                    return;
+                }
+
+                scan_phase = ScanPhase::BuildingIndex;
+                screen.PostEvent(Event::Custom);
+
+                LOG(INFO) << "Building initial file index...";
+                bool index_built = indexer_.build_initial_index(parser_, [&](uint64_t processed, uint64_t total) {
+                    scan_progress = processed;
+                    scan_total = total;
+                    screen.PostEvent(Event::Custom);
+                });
+
+                if (!index_built) {
+                    scan_phase = ScanPhase::Failed;
+                    scan_error_msg = "Failed to scan MFT records or resolve parent paths.";
+                    screen.PostEvent(Event::Custom);
+                    return;
+                }
+
+                // Populate all cached files on background thread before transitioning
+                std::vector<const FileEntry*> temp_all_files;
+                temp_all_files.reserve(indexer_.get_files().size());
+                for (const auto& [id, entry] : indexer_.get_files()) {
+                    temp_all_files.push_back(&entry);
+                }
+                std::sort(temp_all_files.begin(), temp_all_files.end(), [](const FileEntry* a, const FileEntry* b) {
+                    return a->full_path < b->full_path;
+                });
+
+                {
+                    std::lock_guard<std::mutex> lock(search_mutex);
+                    all_files = std::move(temp_all_files);
+                    
+                    // Populate initial search view
+                    bg_filtered_files.clear();
+                    bg_file_names.clear();
+                    for (size_t i = 0; i < std::min<size_t>(200, all_files.size()); ++i) {
+                        bg_filtered_files.push_back(all_files[i]);
+                        std::string prefix = all_files[i]->is_directory ? "[DIR]  " : "[FILE] ";
+                        bg_file_names.push_back(prefix + all_files[i]->full_path);
+                    }
+                    bg_results_ready = true;
+                    scan_phase = ScanPhase::Completed;
+                }
+                screen.PostEvent(Event::Custom);
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Exception in background scan task: " << e.what();
+                scan_phase = ScanPhase::Failed;
+                scan_error_msg = fmt::format("Exception in scan task: {}", e.what());
+                screen.PostEvent(Event::Custom);
+            } catch (...) {
+                LOG(ERROR) << "Unknown exception in background scan task.";
+                scan_phase = ScanPhase::Failed;
+                scan_error_msg = "Unknown exception in background scan task.";
+                screen.PostEvent(Event::Custom);
             }
+        })
+        | stdexec::upon_error([&](std::exception_ptr) {
+            LOG(ERROR) << "Background scan task failed with unhandled sender error.";
+            scan_phase = ScanPhase::Failed;
+            scan_error_msg = "Background scan task failed with unhandled sender error.";
+            screen.PostEvent(Event::Custom);
+        })
+        | stdexec::upon_stopped([&]() {
+            LOG(INFO) << "Background scan task was stopped.";
+            scan_phase = ScanPhase::Failed;
+            scan_error_msg = "Background scan task was stopped.";
             screen.PostEvent(Event::Custom);
         });
 
+    LOG(INFO) << "TuiClient: Spawning scan_sender task.";
     scan_scope.spawn(std::move(scan_sender));
 
+    LOG(INFO) << "TuiClient: Entering screen.Loop().";
     screen.Loop(catch_exit);
+    LOG(INFO) << "TuiClient: screen.Loop() returned. Waiting for scopes to clear.";
 
     stdexec::sync_wait(scope.on_empty());
+    LOG(INFO) << "TuiClient: scope cleared.";
     stdexec::sync_wait(scan_scope.on_empty());
+    LOG(INFO) << "TuiClient: scan_scope cleared. run() exiting.";
 }
