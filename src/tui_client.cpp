@@ -9,6 +9,9 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <stdexec/execution.hpp>
+#include <exec/single_thread_context.hpp>
+#include <exec/async_scope.hpp>
 
 using namespace ftxui;
 
@@ -40,9 +43,6 @@ void TuiClient::run() {
     int selected_index = 0;
 
     std::mutex search_mutex;
-    std::string current_query = "";
-    auto last_input_time = std::chrono::steady_clock::now();
-    bool needs_update = false;
 
     std::vector<const FileEntry*> bg_filtered_files;
     std::vector<std::string> bg_file_names;
@@ -102,75 +102,68 @@ void TuiClient::run() {
     update_search();
 
     // 1. Search Box input component
+    std::atomic<uint64_t> search_id{0};
+    exec::single_thread_context search_ctx;
+    auto search_scheduler = search_ctx.get_scheduler();
+    exec::async_scope scope;
+
     InputOption input_opt;
     input_opt.on_change = [&]() {
-        std::lock_guard<std::mutex> lock(search_mutex);
-        current_query = search_query;
-        last_input_time = std::chrono::steady_clock::now();
-        needs_update = true;
-    };
-    Component input_field = Input(&search_query, "Type to search by name or path...", input_opt);
+        uint64_t my_id = ++search_id;
+        std::string query_to_run = search_query;
 
-    std::atomic<bool> thread_running{true};
-    std::thread search_thread([&]() {
-        while (thread_running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            
-            std::string query_to_run;
-            bool run_search = false;
-            
-            {
-                std::lock_guard<std::mutex> lock(search_mutex);
-                if (needs_update) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (now - last_input_time >= std::chrono::milliseconds(300)) {
-                        query_to_run = current_query;
-                        needs_update = false;
-                        run_search = true;
-                    }
+        auto search_sender = stdexec::schedule(search_scheduler)
+            | stdexec::then([&, my_id, query = std::move(query_to_run)]() {
+                // Debounce delay
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                
+                if (my_id != search_id.load()) {
+                    return;
                 }
-            }
-            
-            if (run_search) {
+
                 std::vector<const FileEntry*> temp_filtered;
                 std::vector<std::string> temp_names;
-                
-                if (query_to_run.empty()) {
+
+                if (query.empty()) {
                     for (size_t i = 0; i < std::min<size_t>(200, all_files.size()); ++i) {
                         temp_filtered.push_back(all_files[i]);
                         std::string prefix = all_files[i]->is_directory ? "[DIR]  " : "[FILE] ";
                         temp_names.push_back(prefix + all_files[i]->full_path);
                     }
                 } else {
-                    std::string query_lower = query_to_run;
+                    std::string query_lower = query;
                     std::transform(query_lower.begin(), query_lower.end(), query_lower.begin(), ::tolower);
 
                     for (const auto* file : all_files) {
                         std::string path_lower = file->full_path;
                         std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(), ::tolower);
-                        
+
                         if (path_lower.find(query_lower) != std::string::npos) {
                             temp_filtered.push_back(file);
                             std::string prefix = file->is_directory ? "[DIR]  " : "[FILE] ";
                             temp_names.push_back(prefix + file->full_path);
-                            
+
                             if (temp_filtered.size() >= 500) {
                                 break;
                             }
                         }
                     }
                 }
-                
+
                 {
                     std::lock_guard<std::mutex> lock(search_mutex);
-                    bg_filtered_files = std::move(temp_filtered);
-                    bg_file_names = std::move(temp_names);
-                    bg_results_ready = true;
+                    if (my_id == search_id.load()) {
+                        bg_filtered_files = std::move(temp_filtered);
+                        bg_file_names = std::move(temp_names);
+                        bg_results_ready = true;
+                        screen.PostEvent(Event::Custom);
+                    }
                 }
-                screen.PostEvent(Event::Custom);
-            }
-        }
-    });
+            });
+
+        scope.spawn(std::move(search_sender));
+    };
+    Component input_field = Input(&search_query, "Type to search by name or path...", input_opt);
 
     // 2. Results list component
     Component file_list = Menu(&file_names, &selected_index);
@@ -248,8 +241,5 @@ void TuiClient::run() {
 
     screen.Loop(catch_exit);
 
-    thread_running = false;
-    if (search_thread.joinable()) {
-        search_thread.join();
-    }
+    stdexec::sync_wait(scope.on_empty());
 }
