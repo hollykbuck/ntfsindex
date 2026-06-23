@@ -237,17 +237,18 @@ void TuiClient::run() {
                         if (query.empty()) {
                             match = true;
                         } else if (current_use_regex) {
-                            match = std::regex_search(file->full_path, pattern);
+                            match = std::regex_search(file->name, pattern);
                         } else {
-                            std::string path_lower = file->full_path;
-                            std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(), ::tolower);
-                            match = (path_lower.find(query_lower) != std::string::npos);
+                            std::string name_lower = file->name;
+                            std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+                            match = (name_lower.find(query_lower) != std::string::npos);
                         }
 
                         if (match) {
                             temp_filtered.push_back(file);
+                            std::string full_path = indexer_.get_absolute_path(file->id);
                             std::string prefix = file->is_directory ? "[DIR]  " : "[FILE] ";
-                            temp_names.push_back(prefix + file->full_path);
+                            temp_names.push_back(prefix + full_path);
 
                             if (temp_filtered.size() >= 500) {
                                 break;
@@ -424,7 +425,7 @@ void TuiClient::run() {
                 details.push_back(text("File Metadata Details") | bold | color(Color::Blue) | hcenter);
                 details.push_back(separator());
                 details.push_back(text(fmt::format("Name:       {}", file->name)) | bold | color(Color::Cyan));
-                details.push_back(text(fmt::format("Full Path:  {}", file->full_path)) | color(Color::White));
+                details.push_back(text(fmt::format("Full Path:  {}", indexer_.get_absolute_path(file->id))) | color(Color::White));
                 details.push_back(text(fmt::format("Type:       {}", file->is_directory ? "Directory" : "File")));
                 details.push_back(text(fmt::format("Size:       {} ({})", format_bytes(file->size), file->size)));
                 details.push_back(text(fmt::format("MFT Record: {}", file->id)));
@@ -701,7 +702,10 @@ void TuiClient::run() {
                     temp_all_files.push_back(&entry);
                 }
                 std::sort(temp_all_files.begin(), temp_all_files.end(), [](const FileEntry* a, const FileEntry* b) {
-                    return a->full_path < b->full_path;
+                    if (a->is_directory != b->is_directory) {
+                        return a->is_directory > b->is_directory;
+                    }
+                    return a->name < b->name;
                 });
 
                 {
@@ -714,7 +718,7 @@ void TuiClient::run() {
                     for (size_t i = 0; i < std::min<size_t>(200, all_files.size()); ++i) {
                         bg_filtered_files.push_back(all_files[i]);
                         std::string prefix = all_files[i]->is_directory ? "[DIR]  " : "[FILE] ";
-                        bg_file_names.push_back(prefix + all_files[i]->full_path);
+                        bg_file_names.push_back(prefix + indexer_.get_absolute_path(all_files[i]->id));
                     }
                     bg_results_ready = true;
                     scan_phase = ScanPhase::Completed;

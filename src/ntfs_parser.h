@@ -12,7 +12,6 @@ struct FileEntry {
     std::string name;
     bool is_directory = false;
     uint64_t size = 0;
-    std::string full_path;
 };
 
 struct DataRun {

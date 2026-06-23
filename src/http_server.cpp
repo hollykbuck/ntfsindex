@@ -261,29 +261,32 @@ handle_request(
 
         std::string query_lower = to_lowercase(query);
 
+        struct SearchMatch {
+            FileEntry entry;
+            std::string full_path;
+        };
+
         auto search_sender = stdexec::schedule(scheduler)
-            | stdexec::then([&]() -> std::vector<FileEntry> {
-                std::vector<FileEntry> m;
+            | stdexec::then([&]() -> std::vector<SearchMatch> {
+                std::vector<SearchMatch> m;
                 const auto& files = indexer.get_files();
                 for (const auto& [id, entry] : files) {
                     std::string name_lower = to_lowercase(entry.name);
-                    std::string path_lower = to_lowercase(entry.full_path);
 
-                    if (name_lower.find(query_lower) != std::string::npos || path_lower.find(query_lower) != std::string::npos) {
-                        m.push_back(entry);
+                    if (name_lower.find(query_lower) != std::string::npos) {
+                        m.push_back({entry, indexer.get_absolute_path(id)});
                     }
                 }
                 return m;
             });
 
         auto search_result = stdexec::sync_wait(std::move(search_sender));
-        std::vector<FileEntry> matches = search_result ? std::get<0>(*search_result) : std::vector<FileEntry>{};
-
+        std::vector<SearchMatch> matches = search_result ? std::get<0>(*search_result) : std::vector<SearchMatch>{};
 
         // Sort matches: Directories first, then alphabetically by full path
-        std::sort(matches.begin(), matches.end(), [](const FileEntry& a, const FileEntry& b) {
-            if (a.is_directory != b.is_directory) {
-                return a.is_directory > b.is_directory; // true (1) before false (0)
+        std::sort(matches.begin(), matches.end(), [](const SearchMatch& a, const SearchMatch& b) {
+            if (a.entry.is_directory != b.entry.is_directory) {
+                return a.entry.is_directory > b.entry.is_directory; // true (1) before false (0)
             }
             return a.full_path < b.full_path;
         });
@@ -292,14 +295,14 @@ handle_request(
         json results = json::array();
         size_t display_count = std::min(matches.size(), limit);
         for (size_t i = 0; i < display_count; ++i) {
-            const auto& entry = matches[i];
+            const auto& match = matches[i];
             results.push_back({
-                {"id", entry.id},
-                {"parent_id", entry.parent_id},
-                {"name", entry.name},
-                {"is_directory", entry.is_directory},
-                {"size", entry.size},
-                {"full_path", entry.full_path}
+                {"id", match.entry.id},
+                {"parent_id", match.entry.parent_id},
+                {"name", match.entry.name},
+                {"is_directory", match.entry.is_directory},
+                {"size", match.entry.size},
+                {"full_path", match.full_path}
             });
         }
 

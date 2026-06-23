@@ -14,8 +14,7 @@ void to_json(nlohmann::json& j, const FileEntry& e) {
         {"parent_id", e.parent_id},
         {"name", e.name},
         {"is_directory", e.is_directory},
-        {"size", e.size},
-        {"full_path", e.full_path}
+        {"size", e.size}
     };
 }
 
@@ -25,7 +24,6 @@ void from_json(const nlohmann::json& j, FileEntry& e) {
     j.at("name").get_to(e.name);
     j.at("is_directory").get_to(e.is_directory);
     j.at("size").get_to(e.size);
-    j.at("full_path").get_to(e.full_path);
 }
 
 namespace {
@@ -84,9 +82,6 @@ bool NtfsIndexer::build_initial_index(NtfsParser& parser, std::function<void(uin
         }
     }
 
-    // Resolve all parent-child full paths
-    resolve_all_paths();
-
     // Query and initialize last USN journal position
     uint64_t usn_mft_idx = 0;
     for (const auto& [id, entry] : files_) {
@@ -139,7 +134,7 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
         if (entry.reason & 0x00000200) { // DELETE
             auto it = files_.find(entry.file_id);
             if (it != files_.end()) {
-                deleted_names[entry.file_id] = it->second.full_path;
+                deleted_names[entry.file_id] = get_absolute_path(entry.file_id);
                 files_.erase(it);
                 deleted++;
             }
@@ -147,7 +142,7 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
         } else {
             FileEntry file_entry;
             bool exists_before = (files_.find(entry.file_id) != files_.end());
-            std::string old_path = exists_before ? files_[entry.file_id].full_path : "";
+            std::string old_path = exists_before ? get_absolute_path(entry.file_id) : "";
 
             if (parser.parse_mft_record_to_entry(entry.file_id, file_entry)) {
                 files_[entry.file_id] = file_entry;
@@ -161,7 +156,7 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
             } else {
                 auto it = files_.find(entry.file_id);
                 if (it != files_.end()) {
-                    deleted_names[entry.file_id] = it->second.full_path;
+                    deleted_names[entry.file_id] = get_absolute_path(entry.file_id);
                     files_.erase(it);
                     deleted++;
                 }
@@ -169,8 +164,6 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
             }
         }
     }
-
-    resolve_all_paths();
 
     LOG(INFO) << "Incremental Update Summary:";
     LOG(INFO) << fmt::format("  - Files Added:    {}", added);
@@ -188,14 +181,15 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
         if (print_count >= 50) break;
         auto it = files_.find(id);
         if (it != files_.end()) {
+            std::string current_path = get_absolute_path(id);
             if (msg.rfind("Modified:", 0) == 0) {
-                if (msg != "Modified: " + it->second.full_path) {
-                    LOG(INFO) << fmt::format("  [RENAMED]   {} -> {}", msg.substr(10), it->second.full_path);
+                if (msg != "Modified: " + current_path) {
+                    LOG(INFO) << fmt::format("  [RENAMED]   {} -> {}", msg.substr(10), current_path);
                 } else {
-                    LOG(INFO) << fmt::format("  [MODIFIED]  {}", it->second.full_path);
+                    LOG(INFO) << fmt::format("  [MODIFIED]  {}", current_path);
                 }
             } else {
-                LOG(INFO) << fmt::format("  [ADDED]     {}", it->second.full_path);
+                LOG(INFO) << fmt::format("  [ADDED]     {}", current_path);
             }
             print_count++;
         }
@@ -210,48 +204,45 @@ bool NtfsIndexer::update_index_incremental(NtfsParser& parser) {
     return true;
 }
 
-void NtfsIndexer::resolve_all_paths() {
-    // Root directory (record 5)
-    files_[5].full_path = "/";
-    files_[5].is_directory = true;
-
-    for (auto& [id, entry] : files_) {
-        if (id == 5) continue;
-
-        std::vector<uint64_t> path_ids;
-        uint64_t curr = id;
-        std::unordered_map<uint64_t, bool> visited;
-
-        while (curr != 5 && curr != 0) {
-            if (visited[curr]) {
-                break; // Cycle detected
-            }
-            visited[curr] = true;
-
-            auto it = files_.find(curr);
-            if (it == files_.end()) {
-                break; // Missing parent record (orphan)
-            }
-
-            path_ids.push_back(curr);
-            curr = it->second.parent_id;
-        }
-
-        std::string path;
-        if (curr == 5) {
-            // Path reached root
-            for (auto r_it = path_ids.rbegin(); r_it != path_ids.rend(); ++r_it) {
-                path += "/" + files_[*r_it].name;
-            }
-        } else {
-            // Orphan path
-            path = "/[orphan]";
-            for (auto r_it = path_ids.rbegin(); r_it != path_ids.rend(); ++r_it) {
-                path += "/" + files_[*r_it].name;
-            }
-        }
-        entry.full_path = path;
+std::string NtfsIndexer::get_absolute_path(uint64_t id) const {
+    if (id == 5) {
+        return "/";
     }
+
+    std::vector<uint64_t> path_ids;
+    uint64_t curr = id;
+    std::unordered_map<uint64_t, bool> visited;
+
+    while (curr != 5 && curr != 0) {
+        if (visited[curr]) {
+            break; // Cycle detected
+        }
+        visited[curr] = true;
+
+        auto it = files_.find(curr);
+        if (it == files_.end()) {
+            break; // Missing parent record (orphan)
+        }
+
+        path_ids.push_back(curr);
+        curr = it->second.parent_id;
+    }
+
+    std::string path;
+    if (curr == 5) {
+        // Path reached root
+        for (auto r_it = path_ids.rbegin(); r_it != path_ids.rend(); ++r_it) {
+            path += "/" + files_.at(*r_it).name;
+        }
+    } else {
+        // Orphan path
+        path = "/[orphan]";
+        for (auto r_it = path_ids.rbegin(); r_it != path_ids.rend(); ++r_it) {
+            path += "/" + files_.at(*r_it).name;
+        }
+    }
+    
+    return path;
 }
 
 void NtfsIndexer::print_stats(const std::string& dev_path) const {

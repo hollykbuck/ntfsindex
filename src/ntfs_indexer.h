@@ -30,14 +30,14 @@ public:
     // Print summary scanning statistics
     void print_stats(const std::string& dev_path) const;
 
+    // Reconstruct absolute path on-the-fly by traversing parent references
+    std::string get_absolute_path(uint64_t id) const;
+
     // Direct tree manipulation helpers for testing
     void test_set_files(const std::unordered_map<uint64_t, FileEntry>& files) { files_ = files; }
     void test_set_last_usn(uint64_t usn) { last_usn_ = usn; }
-    void test_resolve_all_paths() { resolve_all_paths(); }
 
 private:
-    void resolve_all_paths();
-
     std::unordered_map<uint64_t, FileEntry> files_;
     uint64_t last_usn_ = 0;
 };
