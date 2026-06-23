@@ -4,7 +4,7 @@
 
 class TuiClient {
 public:
-    TuiClient(NtfsParser& parser, NtfsIndexer& indexer);
+    TuiClient(NtfsParser& parser, NtfsIndexer& indexer, const std::string& dev_path);
     ~TuiClient() = default;
 
     // Start the TUI interactive loop
@@ -13,4 +13,5 @@ public:
 private:
     NtfsParser& parser_;
     NtfsIndexer& indexer_;
+    std::string dev_path_;
 };

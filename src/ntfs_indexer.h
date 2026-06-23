@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <functional>
 #include "ntfs_parser.h"
 
 class NtfsIndexer {
@@ -11,7 +12,7 @@ public:
     ~NtfsIndexer();
 
     // Perform the initial full MFT scan and build the index
-    bool build_initial_index(NtfsParser& parser);
+    bool build_initial_index(NtfsParser& parser, std::function<void(uint64_t processed, uint64_t total)> progress_cb = nullptr);
 
     // Perform an incremental update based on USN Change Journal
     bool update_index_incremental(NtfsParser& parser);

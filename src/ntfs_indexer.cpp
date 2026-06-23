@@ -22,7 +22,7 @@ std::string format_size(uint64_t bytes) {
 NtfsIndexer::NtfsIndexer() = default;
 NtfsIndexer::~NtfsIndexer() = default;
 
-bool NtfsIndexer::build_initial_index(NtfsParser& parser) {
+bool NtfsIndexer::build_initial_index(NtfsParser& parser, std::function<void(uint64_t processed, uint64_t total)> progress_cb) {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     uint64_t num_records = parser.mft_record_count();
@@ -32,6 +32,9 @@ bool NtfsIndexer::build_initial_index(NtfsParser& parser) {
         FileEntry entry;
         if (parser.parse_mft_record_to_entry(idx, entry)) {
             files_[idx] = entry;
+        }
+        if (progress_cb && (idx % 2000 == 0 || idx == num_records - 1)) {
+            progress_cb(idx + 1, num_records);
         }
     }
 

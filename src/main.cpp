@@ -189,39 +189,39 @@ int main(int argc, char* argv[]) {
 
     NtfsIndexer indexer;
 
-    auto init_sender = stdexec::schedule(scheduler)
-        | stdexec::then([&]() -> bool {
-            LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
-            if (!parser.init(config.device_path)) {
-                return false;
-            }
-
-            LOG(INFO) << "Starting MFT metadata parse...";
-            if (!parser.parse()) {
-                LOG(ERROR) << "Error: MFT parsing failed.";
-                return false;
-            }
-
-            LOG(INFO) << "Building initial file index...";
-            if (!indexer.build_initial_index(parser)) {
-                LOG(ERROR) << "Error: Index build failed.";
-                return false;
-            }
-
-            return true;
-        });
-
-    auto init_result = stdexec::sync_wait(std::move(init_sender));
-    if (!init_result || !std::get<0>(*init_result)) {
-        return 1;
-    }
-
-    indexer.print_stats(config.device_path);
-
     if (absl::GetFlag(FLAGS_tui)) {
-        TuiClient tui(parser, indexer);
+        TuiClient tui(parser, indexer, config.device_path);
         tui.run();
     } else {
+        auto init_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> bool {
+                LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
+                if (!parser.init(config.device_path)) {
+                    return false;
+                }
+
+                LOG(INFO) << "Starting MFT metadata parse...";
+                if (!parser.parse()) {
+                    LOG(ERROR) << "Error: MFT parsing failed.";
+                    return false;
+                }
+
+                LOG(INFO) << "Building initial file index...";
+                if (!indexer.build_initial_index(parser)) {
+                    LOG(ERROR) << "Error: Index build failed.";
+                    return false;
+                }
+
+                return true;
+            });
+
+        auto init_result = stdexec::sync_wait(std::move(init_sender));
+        if (!init_result || !std::get<0>(*init_result)) {
+            return 1;
+        }
+
+        indexer.print_stats(config.device_path);
+
         HttpServer server(parser, indexer, scheduler, io_scheduler, config.address, config.port, config.doc_root, config.device_path);
         if (!server.run()) {
             return 1;

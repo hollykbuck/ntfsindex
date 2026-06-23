@@ -16,6 +16,7 @@
 #include <regex>
 #include <fstream>
 #include <sstream>
+#include "absl/log/log.h"
 
 using namespace ftxui;
 
@@ -35,8 +36,8 @@ std::string format_bytes(uint64_t bytes) {
 
 } // namespace
 
-TuiClient::TuiClient(NtfsParser& parser, NtfsIndexer& indexer)
-    : parser_(parser), indexer_(indexer) {}
+TuiClient::TuiClient(NtfsParser& parser, NtfsIndexer& indexer, const std::string& dev_path)
+    : parser_(parser), indexer_(indexer), dev_path_(dev_path) {}
 
 void TuiClient::run() {
     auto screen = ScreenInteractive::Fullscreen();
@@ -56,35 +57,19 @@ void TuiClient::run() {
 
     // Cache pointers to all files in the index
     std::vector<const FileEntry*> all_files;
-    all_files.reserve(indexer_.get_files().size());
-    for (const auto& [id, entry] : indexer_.get_files()) {
-        all_files.push_back(&entry);
-    }
 
-    // Sort files by path/name for a clean starting view
-    std::sort(all_files.begin(), all_files.end(), [](const FileEntry* a, const FileEntry* b) {
-        return a->full_path < b->full_path;
-    });
-
-    // Helper function to update search results (initial population)
-    auto update_search = [&]() {
-        filtered_files.clear();
-        file_names.clear();
-
-        for (const auto* file : all_files) {
-            filtered_files.push_back(file);
-            std::string prefix = file->is_directory ? "[DIR]  " : "[FILE] ";
-            file_names.push_back(prefix + file->full_path);
-            
-            if (filtered_files.size() >= 200) {
-                break;
-            }
-        }
-        selected_index = 0;
+    // Scan phase and progress tracking
+    enum class ScanPhase {
+        Initializing,
+        ParsingMFT,
+        BuildingIndex,
+        Completed,
+        Failed
     };
-
-    // Initial search population
-    update_search();
+    std::atomic<ScanPhase> scan_phase{ScanPhase::Initializing};
+    std::atomic<uint64_t> scan_progress{0};
+    std::atomic<uint64_t> scan_total{100};
+    std::string scan_error_msg = "";
 
     // Log configuration and reading helpers
     std::string log_file_path = "out.log";
@@ -149,6 +134,9 @@ void TuiClient::run() {
     exec::async_scope scope;
 
     auto trigger_search = [&]() {
+        if (scan_phase.load() != ScanPhase::Completed) {
+            return;
+        }
         uint64_t my_id = ++search_id;
         std::string query_to_run = search_query;
         int current_type_filter = type_filter;
@@ -291,6 +279,43 @@ void TuiClient::run() {
     });
 
     auto renderer = Renderer(main_container, [&] {
+        ScanPhase current_phase = scan_phase.load();
+
+        if (current_phase != ScanPhase::Completed) {
+            Elements body;
+            
+            if (current_phase == ScanPhase::Initializing) {
+                body.push_back(text("Initializing NTFS partition reader...") | hcenter);
+            } else if (current_phase == ScanPhase::ParsingMFT) {
+                body.push_back(text("Parsing NTFS MFT metadata structures...") | hcenter);
+            } else if (current_phase == ScanPhase::BuildingIndex) {
+                float progress_val = static_cast<float>(scan_progress.load()) / static_cast<float>(std::max<uint64_t>(1, scan_total.load()));
+                body.push_back(text(fmt::format("Scanning MFT records: {} / {}", scan_progress.load(), scan_total.load())) | hcenter);
+                body.push_back(separator());
+                body.push_back(gauge(progress_val) | color(Color::Blue));
+                body.push_back(text(fmt::format("Progress: {:.1f}%", progress_val * 100.0f)) | hcenter);
+            } else if (current_phase == ScanPhase::Failed) {
+                body.push_back(text("MFT Scan Failed!") | bold | color(Color::Red) | hcenter);
+                body.push_back(separator());
+                body.push_back(text(scan_error_msg) | color(Color::Red) | hcenter);
+                body.push_back(separator());
+                body.push_back(text("Press ESC to exit.") | dim | hcenter);
+            }
+
+            return vbox({
+                hbox({
+                    text(" NTFS Indexer Terminal UI ") | bold | bgcolor(Color::Blue) | color(Color::White),
+                    filler(),
+                    text(" ESC to exit ") | dim
+                }),
+                separator(),
+                filler(),
+                window(text(" NTFS Partition Initializing and Indexing "), vbox(std::move(body))) 
+                    | size(WIDTH, EQUAL, 80) | hcenter,
+                filler()
+            });
+        }
+
         if (active_tab == 0) {
             Elements details;
             if (selected_index >= 0 && selected_index < static_cast<int>(filtered_files.size())) {
@@ -406,6 +431,21 @@ void TuiClient::run() {
             return true;
         }
 
+        // If scanning is not complete, block all key inputs except custom completion notifications
+        if (scan_phase.load() != ScanPhase::Completed) {
+            if (event == Event::Custom) {
+                std::lock_guard<std::mutex> lock(search_mutex);
+                if (bg_results_ready) {
+                    filtered_files = std::move(bg_filtered_files);
+                    file_names = std::move(bg_file_names);
+                    regex_error = std::move(bg_regex_error);
+                    bg_results_ready = false;
+                }
+                return true;
+            }
+            return false;
+        }
+
         // Tab Switch: F6 or Ctrl+L
         if (event == Event::F6 || is_ctrl_key(event, 'L')) {
             active_tab = 1 - active_tab;
@@ -462,7 +502,81 @@ void TuiClient::run() {
         return false;
     });
 
+    // Start background scan task
+    exec::single_thread_context scan_ctx;
+    auto scan_scheduler = scan_ctx.get_scheduler();
+    exec::async_scope scan_scope;
+
+    auto scan_sender = stdexec::schedule(scan_scheduler)
+        | stdexec::then([&]() {
+            scan_phase = ScanPhase::ParsingMFT;
+            screen.PostEvent(Event::Custom);
+
+            LOG(INFO) << fmt::format("Initializing parser for device: {} ...", dev_path_);
+            if (!parser_.init(dev_path_)) {
+                scan_phase = ScanPhase::Failed;
+                scan_error_msg = fmt::format("Failed to initialize device / block file: {}", dev_path_);
+                screen.PostEvent(Event::Custom);
+                return;
+            }
+
+            LOG(INFO) << "Starting MFT metadata parse...";
+            if (!parser_.parse()) {
+                scan_phase = ScanPhase::Failed;
+                scan_error_msg = "Failed to parse metadata and runs of $MFT.";
+                screen.PostEvent(Event::Custom);
+                return;
+            }
+
+            scan_phase = ScanPhase::BuildingIndex;
+            screen.PostEvent(Event::Custom);
+
+            LOG(INFO) << "Building initial file index...";
+            bool index_built = indexer_.build_initial_index(parser_, [&](uint64_t processed, uint64_t total) {
+                scan_progress = processed;
+                scan_total = total;
+                screen.PostEvent(Event::Custom);
+            });
+
+            if (!index_built) {
+                scan_phase = ScanPhase::Failed;
+                scan_error_msg = "Failed to scan MFT records or resolve parent paths.";
+                screen.PostEvent(Event::Custom);
+                return;
+            }
+
+            // Populate all cached files on background thread before transitioning
+            std::vector<const FileEntry*> temp_all_files;
+            temp_all_files.reserve(indexer_.get_files().size());
+            for (const auto& [id, entry] : indexer_.get_files()) {
+                temp_all_files.push_back(&entry);
+            }
+            std::sort(temp_all_files.begin(), temp_all_files.end(), [](const FileEntry* a, const FileEntry* b) {
+                return a->full_path < b->full_path;
+            });
+
+            {
+                std::lock_guard<std::mutex> lock(search_mutex);
+                all_files = std::move(temp_all_files);
+                
+                // Populate initial search view
+                bg_filtered_files.clear();
+                bg_file_names.clear();
+                for (size_t i = 0; i < std::min<size_t>(200, all_files.size()); ++i) {
+                    bg_filtered_files.push_back(all_files[i]);
+                    std::string prefix = all_files[i]->is_directory ? "[DIR]  " : "[FILE] ";
+                    bg_file_names.push_back(prefix + all_files[i]->full_path);
+                }
+                bg_results_ready = true;
+                scan_phase = ScanPhase::Completed;
+            }
+            screen.PostEvent(Event::Custom);
+        });
+
+    scan_scope.spawn(std::move(scan_sender));
+
     screen.Loop(catch_exit);
 
     stdexec::sync_wait(scope.on_empty());
+    stdexec::sync_wait(scan_scope.on_empty());
 }
