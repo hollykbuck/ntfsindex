@@ -50,13 +50,37 @@ bool NtfsIndexer::build_initial_index(NtfsParser& parser, std::function<void(uin
     uint64_t num_records = parser.mft_record_count();
     files_.reserve(num_records);
 
-    for (uint64_t idx = 0; idx < num_records; ++idx) {
-        FileEntry entry;
-        if (parser.parse_mft_record_to_entry(idx, entry)) {
-            files_[idx] = entry;
+    constexpr uint64_t CHUNK_RECORDS = 4096; // Read 4096 records (4MB) at a time
+    const uint64_t record_size = parser.record_size();
+    std::vector<uint8_t> chunk_buf(CHUNK_RECORDS * record_size);
+
+    for (uint64_t start_idx = 0; start_idx < num_records; start_idx += CHUNK_RECORDS) {
+        uint64_t count = std::min(CHUNK_RECORDS, num_records - start_idx);
+        
+        if (!parser.read_mft_records_bulk(start_idx, count, chunk_buf.data())) {
+            LOG(WARNING) << fmt::format("[Scan] Failed to bulk read MFT records from index {} to {}. Falling back to individual reads.", start_idx, start_idx + count - 1);
+            for (uint64_t i = 0; i < count; ++i) {
+                uint64_t idx = start_idx + i;
+                FileEntry entry;
+                if (parser.parse_mft_record_to_entry(idx, entry)) {
+                    files_[idx] = entry;
+                }
+            }
+        } else {
+            // Process the records in memory
+            for (uint64_t i = 0; i < count; ++i) {
+                uint64_t idx = start_idx + i;
+                uint8_t* record_data = chunk_buf.data() + i * record_size;
+                FileEntry entry;
+                if (parser.parse_mft_record_to_entry(idx, record_data, entry)) {
+                    files_[idx] = entry;
+                }
+            }
         }
-        if (progress_cb && (idx % 2000 == 0 || idx == num_records - 1)) {
-            progress_cb(idx + 1, num_records);
+
+        if (progress_cb) {
+            uint64_t processed = std::min(start_idx + count, num_records);
+            progress_cb(processed, num_records);
         }
     }
 

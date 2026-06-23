@@ -328,6 +328,17 @@ bool NtfsParser::read_mft_record(uint64_t record_idx, std::vector<uint8_t>& buf)
     }
 }
 
+bool NtfsParser::read_mft_records_bulk(uint64_t start_idx, uint64_t count, uint8_t* dest_buf) {
+    uint64_t mft_offset = start_idx * record_size_;
+    size_t size = count * record_size_;
+    if (mft_runs_.empty()) {
+        uint64_t physical_offset = mft_start_offset_ + mft_offset;
+        return read_disk(physical_offset, dest_buf, size);
+    } else {
+        return read_from_runs(mft_runs_, mft_offset, dest_buf, size);
+    }
+}
+
 bool NtfsParser::parse() {
     // 1. Read MFT Record 0 ($MFT itself) if not in raw MFT mode
     if (is_raw_mft_) {
@@ -401,11 +412,14 @@ bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
     if (!read_mft_record(idx, rec_buf)) {
         return false;
     }
+    return parse_mft_record_to_entry(idx, rec_buf.data(), entry);
+}
 
-    MFT_REC* rec = reinterpret_cast<MFT_REC*>(rec_buf.data());
+bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, uint8_t* record_data, FileEntry& entry) {
+    MFT_REC* rec = reinterpret_cast<MFT_REC*>(record_data);
 
     // Perform Fixups
-    if (!apply_fixups(rec_buf.data(), record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
+    if (!apply_fixups(record_data, record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
         return false;
     }
 
@@ -434,7 +448,7 @@ bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
     // Iterate over attributes in record
     uint32_t attr_offset = rec->attr_off;
     while (attr_offset + 24 <= rec->used) {
-        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(rec_buf.data() + attr_offset);
+        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(record_data + attr_offset);
         if (attrib->type == ATTR_END) {
             break;
         }

@@ -48,6 +48,8 @@ public:
     };
 
     bool parse_mft_record_to_entry(uint64_t idx, FileEntry& entry);
+    bool parse_mft_record_to_entry(uint64_t idx, uint8_t* record_data, FileEntry& entry);
+    bool read_mft_records_bulk(uint64_t start_idx, uint64_t count, uint8_t* dest_buf);
     bool parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t usn_mft_idx, uint64_t start_usn = 0, uint64_t* next_usn = nullptr);
     uint64_t query_current_usn(uint64_t usn_mft_idx);
 
