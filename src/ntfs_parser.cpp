@@ -328,6 +328,17 @@ bool NtfsParser::read_mft_record(uint64_t record_idx, std::vector<uint8_t>& buf)
     }
 }
 
+bool NtfsParser::read_mft_records_bulk(uint64_t start_idx, uint64_t count, uint8_t* dest_buf) {
+    uint64_t mft_offset = start_idx * record_size_;
+    size_t size = count * record_size_;
+    if (mft_runs_.empty()) {
+        uint64_t physical_offset = mft_start_offset_ + mft_offset;
+        return read_disk(physical_offset, dest_buf, size);
+    } else {
+        return read_from_runs(mft_runs_, mft_offset, dest_buf, size);
+    }
+}
+
 bool NtfsParser::parse() {
     // 1. Read MFT Record 0 ($MFT itself) if not in raw MFT mode
     if (is_raw_mft_) {
@@ -401,11 +412,14 @@ bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
     if (!read_mft_record(idx, rec_buf)) {
         return false;
     }
+    return parse_mft_record_to_entry(idx, rec_buf.data(), entry);
+}
 
-    MFT_REC* rec = reinterpret_cast<MFT_REC*>(rec_buf.data());
+bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, uint8_t* record_data, FileEntry& entry) {
+    MFT_REC* rec = reinterpret_cast<MFT_REC*>(record_data);
 
     // Perform Fixups
-    if (!apply_fixups(rec_buf.data(), record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
+    if (!apply_fixups(record_data, record_size_, rec->rhdr.fix_off, rec->rhdr.fix_num)) {
         return false;
     }
 
@@ -434,7 +448,7 @@ bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
     // Iterate over attributes in record
     uint32_t attr_offset = rec->attr_off;
     while (attr_offset + 24 <= rec->used) {
-        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(rec_buf.data() + attr_offset);
+        const ATTRIB* attrib = reinterpret_cast<const ATTRIB*>(record_data + attr_offset);
         if (attrib->type == ATTR_END) {
             break;
         }
@@ -496,6 +510,7 @@ bool NtfsParser::parse_mft_record_to_entry(uint64_t idx, FileEntry& entry) {
 
 bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64_t usn_mft_idx, uint64_t start_usn, uint64_t* next_usn) {
     if (usn_mft_idx == 0) {
+        LOG(WARNING) << "[USN Parse] USN MFT index is 0. USN Change Journal ($UsnJrnl) is not active or could not be found on this volume.";
         return false;
     }
 
@@ -691,8 +706,8 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
     uint64_t curr_offset = active_offset;
     if (start_usn > 0) {
         if (start_usn < active_offset) {
-            LOG(INFO) << fmt::format("[USN Parse] start_usn 0x{:X} is older than active offset 0x{:X}. Journal was truncated.", start_usn, active_offset);
-            curr_offset = active_offset;
+            LOG(WARNING) << fmt::format("[USN Parse] start_usn 0x{:X} is older than active offset 0x{:X}. Journal was truncated. Incremental update is invalid.", start_usn, active_offset);
+            return false;
         } else if (start_usn > j_stream_size) {
             LOG(INFO) << fmt::format("[USN Parse] start_usn 0x{:X} is beyond stream size 0x{:X}.", start_usn, j_stream_size);
             curr_offset = j_stream_size;
@@ -760,6 +775,8 @@ bool NtfsParser::parse_usn_journal(std::vector<UsnJournalEntry>& entries, uint64
     if (next_usn) {
         *next_usn = curr_offset;
     }
+
+    LOG(INFO) << fmt::format("[USN Parse] Successfully parsed {} USN journal entries. Next USN: 0x{:X}", entries.size(), curr_offset);
 
     return true;
 }

@@ -6,11 +6,9 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
-#include <chrono>
 #include <ctime>
 #include <fstream>
 #include <fmt/format.h>
-#include <nlohmann/json.hpp>
 #include "ntfs_parser.h"
 #include "ntfs_indexer.h"
 #include "http_server.h"
@@ -27,12 +25,26 @@
 #include <mutex>
 #include <cstdlib>
 #include <memory>
+#include <stdexec/execution.hpp>
+#include <exec/single_thread_context.hpp>
+#include <exec/asio/asio_thread_pool.hpp>
+#include <exec/asio/use_sender.hpp>
+#include <exec/async_scope.hpp>
+#include <utility>
+
+#include <boost/beast/http.hpp>
+#include <boost/beast/core.hpp>
+
+
+using SchedulerType = decltype(std::declval<exec::single_thread_context>().get_scheduler());
+
 
 namespace {
 
 class FileLogSink : public absl::LogSink {
  public:
-  explicit FileLogSink(const std::string& filename) : file_(filename, std::ios::app) {}
+  FileLogSink(const std::string& filename, absl::LogSeverityAtLeast min_severity)
+      : file_(filename, std::ios::app), min_severity_(min_severity) {}
   ~FileLogSink() override {
       std::lock_guard<std::mutex> lock(mutex_);
       if (file_.is_open()) {
@@ -41,6 +53,10 @@ class FileLogSink : public absl::LogSink {
   }
 
   void Send(const absl::LogEntry& entry) override {
+    if (!should_log(entry.log_severity())) {
+      return;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (file_.is_open()) {
       file_ << entry.text_message_with_prefix_and_newline();
@@ -49,14 +65,31 @@ class FileLogSink : public absl::LogSink {
   }
 
  private:
+  bool should_log(absl::LogSeverity severity) const {
+    switch (min_severity_) {
+      case absl::LogSeverityAtLeast::kInfo:
+        return severity >= absl::LogSeverity::kInfo;
+      case absl::LogSeverityAtLeast::kWarning:
+        return severity >= absl::LogSeverity::kWarning;
+      case absl::LogSeverityAtLeast::kError:
+        return severity >= absl::LogSeverity::kError;
+      case absl::LogSeverityAtLeast::kFatal:
+        return severity >= absl::LogSeverity::kFatal;
+      case absl::LogSeverityAtLeast::kInfinity:
+        return false;
+    }
+    return true;
+  }
+
   std::ofstream file_;
   std::mutex mutex_;
+  absl::LogSeverityAtLeast min_severity_;
 };
 
 class ScopedFileLogger {
 public:
-    explicit ScopedFileLogger(const std::string& filename) {
-        sink_ = std::make_unique<FileLogSink>(filename);
+    ScopedFileLogger(const std::string& filename, absl::LogSeverityAtLeast min_severity) {
+        sink_ = std::make_unique<FileLogSink>(filename, min_severity);
         absl::AddLogSink(sink_.get());
     }
     ~ScopedFileLogger() {
@@ -67,6 +100,37 @@ public:
 private:
     std::unique_ptr<FileLogSink> sink_;
 };
+
+absl::LogSeverityAtLeast parse_log_level_env(const char* value) {
+    if (!value || value[0] == '\0') {
+        return absl::LogSeverityAtLeast::kInfo;
+    }
+
+    std::string level = value;
+    std::transform(level.begin(), level.end(), level.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    if (level == "info") {
+        return absl::LogSeverityAtLeast::kInfo;
+    }
+    if (level == "warning" || level == "warn") {
+        return absl::LogSeverityAtLeast::kWarning;
+    }
+    if (level == "error" || level == "err") {
+        return absl::LogSeverityAtLeast::kError;
+    }
+    if (level == "fatal") {
+        return absl::LogSeverityAtLeast::kFatal;
+    }
+    if (level == "off" || level == "none" || level == "disabled") {
+        return absl::LogSeverityAtLeast::kInfinity;
+    }
+
+    LOG(WARNING) << fmt::format(
+        "Invalid NTFSINDEX_LOG_LEVEL '{}'. Supported values: INFO, WARNING, ERROR, FATAL, OFF. Falling back to INFO.",
+        value);
+    return absl::LogSeverityAtLeast::kInfo;
+}
 
 std::string to_lowercase(const std::string& str) {
     std::string lower = str;
@@ -122,51 +186,25 @@ struct AppConfig {
     uint16_t port = 8080;
     std::string address = "0.0.0.0";
     std::string doc_root = "./web";
+    uint32_t auto_update_interval = 0;
+    std::string cache_file = "";
 };
-
-AppConfig load_config(const std::string& path) {
-    AppConfig config;
-    std::ifstream f(path);
-    if (!f.is_open()) {
-        LOG(INFO) << "[Config] Configuration file not found or couldn't be opened: " << path << ". Using defaults.";
-        return config;
-    }
-    try {
-        nlohmann::json j;
-        f >> j;
-        if (j.contains("device_path") && j["device_path"].is_string()) {
-            config.device_path = j["device_path"].get<std::string>();
-        }
-        if (j.contains("port") && j["port"].is_number_integer()) {
-            config.port = j["port"].get<uint16_t>();
-        }
-        if (j.contains("address") && j["address"].is_string()) {
-            config.address = j["address"].get<std::string>();
-        }
-        if (j.contains("doc_root") && j["doc_root"].is_string()) {
-            config.doc_root = j["doc_root"].get<std::string>();
-        }
-        LOG(INFO) << "[Config] Loaded configuration from: " << path;
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "[Config] Error parsing " << path << ": " << e.what() << ". Using defaults.";
-    }
-    return config;
-}
 
 } // namespace
 
 // Define Abseil command line flags
-ABSL_FLAG(std::string, device_path, "", "Path to raw MFT file or partition (e.g. \\\\.\\C: or $MFT)");
-ABSL_FLAG(uint16_t, port, 0, "Port for the HTTP API server (e.g. 8080)");
-ABSL_FLAG(std::string, address, "", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
-ABSL_FLAG(std::string, doc_root, "", "Document root directory serving frontend assets");
-ABSL_FLAG(std::string, config, "config.json", "Path to config.json file containing default options");
+ABSL_FLAG(std::string, device_path, "$MFT", "Path to raw MFT file or partition (e.g. \\\\.\\C: or $MFT)");
+ABSL_FLAG(uint16_t, port, 8080, "Port for the HTTP API server (e.g. 8080)");
+ABSL_FLAG(std::string, address, "0.0.0.0", "IP address to bind the HTTP server to (e.g. 0.0.0.0)");
+ABSL_FLAG(std::string, doc_root, "./web", "Document root directory serving frontend assets");
 ABSL_FLAG(bool, tui, false, "Start in interactive TUI mode instead of HTTP Server");
+ABSL_FLAG(uint32_t, auto_update_interval, 0, "Interval in seconds for automatic incremental updates (0 to disable)");
+ABSL_FLAG(std::string, cache_file, "", "Path to the cache file (empty to disable caching)");
 
 int main(int argc, char* argv[]) {
     // Initialize Abseil Program Usage and Parse CommandLine
-    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using config.json, arguments, or flags.");
-    auto positional_args = absl::ParseCommandLine(argc, argv);
+    absl::SetProgramUsageMessage("NTFS Indexer and HTTP Search Server. Start using flags or standard flagfile (e.g. --flagfile=flags.txt).");
+    absl::ParseCommandLine(argc, argv);
 
     // Initialize Abseil Logging
     absl::InitializeLog();
@@ -175,7 +213,9 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<ScopedFileLogger> file_logger;
     const char* log_file_env = std::getenv("NTFSINDEX_LOG_FILE");
     if (log_file_env && log_file_env[0] != '\0') {
-        file_logger = std::make_unique<ScopedFileLogger>(log_file_env);
+        file_logger = std::make_unique<ScopedFileLogger>(
+            log_file_env,
+            parse_log_level_env(std::getenv("NTFSINDEX_LOG_LEVEL")));
     }
 
     // Silence stderr logging in TUI mode to avoid terminal corruption
@@ -183,37 +223,14 @@ int main(int argc, char* argv[]) {
         absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
     }
 
-    // 1. Load config file
-    std::string config_path = absl::GetFlag(FLAGS_config);
-    AppConfig config = load_config(config_path);
-
-    // 2. Override with legacy positional arguments if provided
-    // Usage: prog_name <device_path> [port] [doc_root]
-    if (positional_args.size() >= 2) {
-        config.device_path = positional_args[1];
-    }
-    if (positional_args.size() >= 3) {
-        try {
-            config.port = static_cast<uint16_t>(std::stoul(positional_args[2]));
-        } catch (...) {}
-    }
-    if (positional_args.size() >= 4) {
-        config.doc_root = positional_args[3];
-    }
-
-    // 3. Override with explicit Abseil flags if specified on CLI
-    if (!absl::GetFlag(FLAGS_device_path).empty()) {
-        config.device_path = absl::GetFlag(FLAGS_device_path);
-    }
-    if (absl::GetFlag(FLAGS_port) != 0) {
-        config.port = absl::GetFlag(FLAGS_port);
-    }
-    if (!absl::GetFlag(FLAGS_address).empty()) {
-        config.address = absl::GetFlag(FLAGS_address);
-    }
-    if (!absl::GetFlag(FLAGS_doc_root).empty()) {
-        config.doc_root = absl::GetFlag(FLAGS_doc_root);
-    }
+    // Load config options from Abseil flags
+    AppConfig config;
+    config.device_path = absl::GetFlag(FLAGS_device_path);
+    config.port = absl::GetFlag(FLAGS_port);
+    config.address = absl::GetFlag(FLAGS_address);
+    config.doc_root = absl::GetFlag(FLAGS_doc_root);
+    config.auto_update_interval = absl::GetFlag(FLAGS_auto_update_interval);
+    config.cache_file = absl::GetFlag(FLAGS_cache_file);
 
     LOG(INFO) << "---------------------------------------------";
     LOG(INFO) << "[Server Config Options]";
@@ -221,34 +238,83 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << fmt::format("  - Listen Address:  {}", config.address);
     LOG(INFO) << fmt::format("  - Listen Port:     {}", config.port);
     LOG(INFO) << fmt::format("  - Frontend Root:   {}", config.doc_root);
+    LOG(INFO) << fmt::format("  - Auto Update:     {}s", config.auto_update_interval == 0 ? "Disabled" : std::to_string(config.auto_update_interval));
+    LOG(INFO) << fmt::format("  - Cache File:      {}", config.cache_file.empty() ? "Disabled" : config.cache_file);
     LOG(INFO) << "---------------------------------------------";
 
-    LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
+    exec::single_thread_context worker_ctx;
+    auto scheduler = worker_ctx.get_scheduler();
+
+    exec::asio::asio_thread_pool io_pool(2);
+    auto io_scheduler = io_pool.get_scheduler();
+
     NtfsParser parser;
-    if (!parser.init(config.device_path)) {
-        return 1;
-    }
 
-    LOG(INFO) << "Starting MFT metadata parse...";
-    if (!parser.parse()) {
-        LOG(ERROR) << "Error: MFT parsing failed.";
-        return 1;
-    }
-
-    LOG(INFO) << "Building initial file index...";
     NtfsIndexer indexer;
-    if (!indexer.build_initial_index(parser)) {
-        LOG(ERROR) << "Error: Index build failed.";
-        return 1;
-    }
-
-    indexer.print_stats(config.device_path);
 
     if (absl::GetFlag(FLAGS_tui)) {
-        TuiClient tui(parser, indexer);
+        TuiClient tui(parser, indexer, config.device_path, config.cache_file);
         tui.run();
     } else {
-        HttpServer server(parser, indexer, config.address, config.port, config.doc_root, config.device_path);
+        auto init_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> bool {
+                LOG(INFO) << fmt::format("Initializing parser for device: {} ...", config.device_path);
+                if (!parser.init(config.device_path)) {
+                    return false;
+                }
+
+                LOG(INFO) << "Starting MFT metadata parse...";
+                if (!parser.parse()) {
+                    LOG(ERROR) << "Error: MFT parsing failed.";
+                    return false;
+                }
+
+                bool loaded_from_cache = false;
+                if (!config.cache_file.empty()) {
+                    LOG(INFO) << fmt::format("Attempting to load index from cache file: {} ...", config.cache_file);
+                    if (indexer.load_from_cache(config.cache_file)) {
+                        LOG(INFO) << "Successfully loaded index from cache. Applying pending USN Change Journal entries to catch up...";
+                        if (!indexer.update_index_incremental(parser)) {
+                            LOG(WARNING) << "Failed to perform incremental catch-up (USN journal may have been truncated or is disabled). Discarding cache and rebuilding index...";
+                        } else {
+                            LOG(INFO) << "Catch-up successful. Index is up to date.";
+                            loaded_from_cache = true;
+                        }
+                    } else {
+                        LOG(WARNING) << "Failed to load index from cache (or cache file does not exist). Proceeding with full scan.";
+                    }
+                }
+
+                if (!loaded_from_cache) {
+                    LOG(INFO) << "Building initial file index...";
+                    if (!indexer.build_initial_index(parser)) {
+                        LOG(ERROR) << "Error: Index build failed.";
+                        return false;
+                    }
+
+                    if (!config.cache_file.empty()) {
+                        LOG(INFO) << fmt::format("Saving built index to cache file: {} ...", config.cache_file);
+                        if (indexer.save_to_cache(config.cache_file)) {
+                            LOG(INFO) << "Successfully saved index to cache.";
+                        } else {
+                            LOG(ERROR) << "Failed to save index to cache.";
+                        }
+                    }
+                }
+
+                return true;
+            });
+
+        auto init_result = stdexec::sync_wait(std::move(init_sender));
+        if (!init_result || !std::get<0>(*init_result)) {
+            return 1;
+        }
+
+        indexer.print_stats(config.device_path);
+
+
+
+        HttpServer server(parser, indexer, scheduler, io_scheduler, config.address, config.port, config.doc_root, config.device_path, config.auto_update_interval);
         if (!server.run()) {
             return 1;
         }

@@ -1,0 +1,8 @@
+# Example flags file for ntfsindex.
+# Usage: build\Debug\ntfsindex.exe --flagfile=flags.example.txt
+
+--device_path=$MFT
+--port=8080
+--address=0.0.0.0
+--doc_root=./web
+--auto_update_interval=0

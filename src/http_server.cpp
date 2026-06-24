@@ -2,7 +2,9 @@
 #include "ntfs_parser.h"
 #include "absl/log/log.h"
 #include "ntfs_indexer.h"
-
+#include <stdexec/execution.hpp>
+#include <exec/start_detached.hpp>
+#include <exec/asio/use_sender.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
@@ -136,17 +138,42 @@ std::string to_lowercase(const std::string& str) {
     return lower;
 }
 
+class AccessLogGuard {
+ public:
+    AccessLogGuard(std::string method, std::string target, std::string client_ip)
+        : method_(std::move(method)), target_(std::move(target)), client_ip_(std::move(client_ip)),
+          start_(std::chrono::high_resolution_clock::now()) {
+        LOG(INFO) << fmt::format("[Access Log] HTTP {} {} (Request received from {})", method_, target_, client_ip_);
+    }
+    ~AccessLogGuard() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start_).count();
+        LOG(INFO) << fmt::format("[Access Log] HTTP {} {} -> Completed in {} ms for {}", method_, target_, elapsed, client_ip_);
+    }
+
+ private:
+    std::string method_;
+    std::string target_;
+    std::string client_ip_;
+    std::chrono::high_resolution_clock::time_point start_;
+};
+
 // Produce an HTTP response for the request
 template<class Body, class Allocator>
 http::message_generator
 handle_request(
-    beast::string_view doc_root,
     http::request<Body, http::basic_fields<Allocator>>&& req,
-    NtfsParser& parser,
-    NtfsIndexer& indexer,
-    std::mutex& mtx,
-    const std::string& dev_path)
+    const HttpContext& ctx,
+    const std::string& client_ip)
 {
+    AccessLogGuard log_guard(std::string(req.method_string()), std::string(req.target()), client_ip);
+
+    auto& parser = ctx.parser;
+    auto& indexer = ctx.indexer;
+    auto scheduler = ctx.worker_scheduler;
+    beast::string_view doc_root = ctx.doc_root;
+    std::string dev_path(ctx.dev_path);
+
     auto const bad_request =
     [&req](beast::string_view why)
     {
@@ -234,25 +261,32 @@ handle_request(
 
         std::string query_lower = to_lowercase(query);
 
-        std::vector<FileEntry> matches;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            const auto& files = indexer.get_files();
+        struct SearchMatch {
+            FileEntry entry;
+            std::string full_path;
+        };
 
-            for (const auto& [id, entry] : files) {
-                std::string name_lower = to_lowercase(entry.name);
-                std::string path_lower = to_lowercase(entry.full_path);
+        auto search_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> std::vector<SearchMatch> {
+                std::vector<SearchMatch> m;
+                const auto& files = indexer.get_files();
+                for (const auto& [id, entry] : files) {
+                    std::string name_lower = to_lowercase(entry.name);
 
-                if (name_lower.find(query_lower) != std::string::npos || path_lower.find(query_lower) != std::string::npos) {
-                    matches.push_back(entry);
+                    if (name_lower.find(query_lower) != std::string::npos) {
+                        m.push_back({entry, indexer.get_absolute_path(id)});
+                    }
                 }
-            }
-        }
+                return m;
+            });
+
+        auto search_result = stdexec::sync_wait(std::move(search_sender));
+        std::vector<SearchMatch> matches = search_result ? std::get<0>(*search_result) : std::vector<SearchMatch>{};
 
         // Sort matches: Directories first, then alphabetically by full path
-        std::sort(matches.begin(), matches.end(), [](const FileEntry& a, const FileEntry& b) {
-            if (a.is_directory != b.is_directory) {
-                return a.is_directory > b.is_directory; // true (1) before false (0)
+        std::sort(matches.begin(), matches.end(), [](const SearchMatch& a, const SearchMatch& b) {
+            if (a.entry.is_directory != b.entry.is_directory) {
+                return a.entry.is_directory > b.entry.is_directory; // true (1) before false (0)
             }
             return a.full_path < b.full_path;
         });
@@ -261,14 +295,14 @@ handle_request(
         json results = json::array();
         size_t display_count = std::min(matches.size(), limit);
         for (size_t i = 0; i < display_count; ++i) {
-            const auto& entry = matches[i];
+            const auto& match = matches[i];
             results.push_back({
-                {"id", entry.id},
-                {"parent_id", entry.parent_id},
-                {"name", entry.name},
-                {"is_directory", entry.is_directory},
-                {"size", entry.size},
-                {"full_path", entry.full_path}
+                {"id", match.entry.id},
+                {"parent_id", match.entry.parent_id},
+                {"name", match.entry.name},
+                {"is_directory", match.entry.is_directory},
+                {"size", match.entry.size},
+                {"full_path", match.full_path}
             });
         }
 
@@ -286,22 +320,38 @@ handle_request(
             return bad_request("Unknown HTTP-method for /api/stats");
         }
 
+        struct StatsResult {
+            size_t file_count = 0;
+            size_t dir_count = 0;
+            uint64_t total_bytes = 0;
+        };
+
+        auto stats_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> StatsResult {
+                StatsResult res;
+                const auto& files = indexer.get_files();
+                for (const auto& [id, entry] : files) {
+                    if (entry.is_directory) {
+                        res.dir_count++;
+                    } else {
+                        res.file_count++;
+                        res.total_bytes += entry.size;
+                    }
+                }
+                return res;
+            });
+
+        auto stats_result = stdexec::sync_wait(std::move(stats_sender));
         size_t file_count = 0;
         size_t dir_count = 0;
         uint64_t total_bytes = 0;
-
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            const auto& files = indexer.get_files();
-            for (const auto& [id, entry] : files) {
-                if (entry.is_directory) {
-                    dir_count++;
-                } else {
-                    file_count++;
-                    total_bytes += entry.size;
-                }
-            }
+        if (stats_result) {
+            auto res = std::get<0>(*stats_result);
+            file_count = res.file_count;
+            dir_count = res.dir_count;
+            total_bytes = res.total_bytes;
         }
+
 
         auto format_size_local = [](uint64_t bytes) {
             const char* suffixes[] = {"B", "KB", "MB", "GB", "TB"};
@@ -338,25 +388,39 @@ handle_request(
             } catch (...) {}
         }
 
+        struct UsnResult {
+            bool success = false;
+            std::vector<NtfsParser::UsnJournalEntry> usn_entries;
+        };
+
+        auto usn_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> UsnResult {
+                UsnResult res;
+                const auto& files = indexer.get_files();
+
+                uint64_t usn_mft_idx = 0;
+                for (const auto& [id, entry] : files) {
+                    if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
+                        usn_mft_idx = id;
+                        break;
+                    }
+                }
+
+                if (usn_mft_idx != 0) {
+                    res.success = parser.parse_usn_journal(res.usn_entries, usn_mft_idx);
+                }
+                return res;
+            });
+
+        auto usn_result = stdexec::sync_wait(std::move(usn_sender));
         std::vector<NtfsParser::UsnJournalEntry> usn_entries;
         bool success = false;
-        
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            const auto& files = indexer.get_files();
-
-            uint64_t usn_mft_idx = 0;
-            for (const auto& [id, entry] : files) {
-                if (entry.parent_id == 11 && entry.name == "$UsnJrnl") {
-                    usn_mft_idx = id;
-                    break;
-                }
-            }
-
-            if (usn_mft_idx != 0) {
-                success = parser.parse_usn_journal(usn_entries, usn_mft_idx);
-            }
+        if (usn_result) {
+            auto res = std::get<0>(*usn_result);
+            success = res.success;
+            usn_entries = std::move(res.usn_entries);
         }
+
 
         if (!success) {
             return json_response(json{
@@ -432,12 +496,15 @@ handle_request(
         }
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = false;
-        
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            success = indexer.update_index_incremental(parser);
-        }
+
+        auto update_sender = stdexec::schedule(scheduler)
+            | stdexec::then([&]() -> bool {
+                return indexer.update_index_incremental(parser);
+            });
+
+        auto update_result = stdexec::sync_wait(std::move(update_sender));
+        bool success = update_result ? std::get<0>(*update_result) : false;
+
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -506,43 +573,119 @@ handle_request(
     return res;
 }
 
+inline auto read_context() {
+    return stdexec::read_env(context::get_context);
+}
+
 // Handles an HTTP server connection
-void do_session(tcp::socket socket, std::string doc_root, NtfsParser& parser, NtfsIndexer& indexer, std::mutex& mtx, std::string dev_path) {
-    bool close = false;
-    beast::error_code ec;
-
-    beast::flat_buffer buffer;
-
-    for(;;) {
+void do_session(tcp::socket socket, const HttpContext& ctx, exec::async_scope& scope) {
+    struct Session {
+        tcp::socket socket;
+        beast::flat_buffer buffer;
         http::request<http::string_body> req;
-        http::read(socket, buffer, req, ec);
-        if(ec == http::error::end_of_stream)
-            break;
-        if(ec) {
-            break;
-        }
-
-        auto msg = handle_request(doc_root, std::move(req), parser, indexer, mtx, dev_path);
-        close = !msg.keep_alive();
+        std::string client_ip;
+    };
+    
+    boost::system::error_code ec;
+    auto remote = socket.remote_endpoint(ec);
+    std::string client_ip = ec ? "unknown" : fmt::format("{}:{}", remote.address().to_string(), remote.port());
+    
+    auto s = std::make_shared<Session>(Session{std::move(socket), {}, {}, client_ip});
+    
+    auto run_cycle = std::make_shared<std::function<void()>>();
+    *run_cycle = [s, ctx, &scope, run_cycle]() {
+        auto read_sender = http::async_read(s->socket, s->buffer, s->req, exec::asio::use_sender);
         
-        beast::write(socket, std::move(msg), ec);
-        if(ec) {
-            break;
-        }
-        if(close) {
-            break;
-        }
-    }
+        auto pipeline = std::move(read_sender)
+            | stdexec::continues_on(ctx.worker_scheduler)
+            | stdexec::let_value([s](std::size_t) mutable {
+                return read_context()
+                    | stdexec::then([s](const HttpContext& read_ctx) mutable {
+                        auto msg = handle_request(std::move(s->req), read_ctx, s->client_ip);
+                        bool keep_alive = msg.keep_alive();
+                        return std::make_pair(std::move(msg), keep_alive);
+                    });
+            })
+            | stdexec::continues_on(ctx.io_scheduler)
+            | stdexec::let_value([s](std::pair<http::message_generator, bool>& result) mutable {
+                auto msg = std::move(result.first);
+                bool keep_alive = result.second;
+                return beast::async_write(s->socket, std::move(msg), exec::asio::use_sender)
+                    | stdexec::then([keep_alive](std::size_t) {
+                        return keep_alive;
+                    });
+            })
+            | stdexec::then([s, run_cycle](bool keep_alive) {
+                if (keep_alive) {
+                    s->req = {};
+                    (*run_cycle)();
+                } else {
+                    boost::system::error_code ec;
+                    s->socket.shutdown(tcp::socket::shutdown_both, ec);
+                }
+            })
+            | stdexec::upon_error([s](std::exception_ptr) {
+                boost::system::error_code ec;
+                s->socket.shutdown(tcp::socket::shutdown_both, ec);
+            })
+            | stdexec::upon_stopped([s]() {
+                boost::system::error_code ec;
+                s->socket.shutdown(tcp::socket::shutdown_both, ec);
+            })
+            | stdexec::write_env(stdexec::prop{context::get_context, std::ref(ctx)});
 
-    socket.shutdown(tcp::socket::shutdown_both, ec);
+        scope.spawn(std::move(pipeline));
+    };
+
+    (*run_cycle)();
 }
 
 } // namespace
 
-HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path)
-    : parser_(parser), indexer_(indexer), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path) {}
+HttpServer::HttpServer(NtfsParser& parser, NtfsIndexer& indexer, WorkerSchedulerType worker_scheduler, IoSchedulerType io_scheduler, const std::string& address, unsigned short port, const std::string& doc_root, const std::string& dev_path, uint32_t auto_update_interval)
+    : parser_(parser), indexer_(indexer), worker_scheduler_(worker_scheduler), io_scheduler_(io_scheduler), address_(address), port_(port), doc_root_(doc_root), dev_path_(dev_path), auto_update_interval_(auto_update_interval) {
+    if (auto_update_interval_ > 0) {
+        stop_auto_update_ = false;
+        auto_update_thread_ = std::thread([this]() {
+            LOG(INFO) << fmt::format("[Auto Update] Started background auto-update thread with interval: {} seconds", auto_update_interval_);
+            while (!stop_auto_update_) {
+                std::unique_lock<std::mutex> lock(auto_update_mutex_);
+                if (auto_update_cv_.wait_for(lock, std::chrono::seconds(auto_update_interval_), [this]() { return stop_auto_update_.load(); })) {
+                    break;
+                }
+                
+                // Dispatch the update task to the worker scheduler and wait for it to complete
+                auto update_sender = stdexec::schedule(worker_scheduler_)
+                    | stdexec::then([this]() {
+                        LOG(INFO) << "[Auto Update] Triggering scheduled incremental update...";
+                        auto start_time = std::chrono::high_resolution_clock::now();
+                        bool success = indexer_.update_index_incremental(parser_);
+                        auto end_time = std::chrono::high_resolution_clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                        if (success) {
+                            LOG(INFO) << fmt::format("[Auto Update] Scheduled incremental update succeeded in {} ms.", elapsed.count());
+                        } else {
+                            LOG(ERROR) << "[Auto Update] Scheduled incremental update failed.";
+                        }
+                    });
+                stdexec::sync_wait(std::move(update_sender));
+            }
+            LOG(INFO) << "[Auto Update] Background auto-update thread stopped.";
+        });
+    }
+}
 
-HttpServer::~HttpServer() = default;
+HttpServer::~HttpServer() {
+    if (auto_update_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(auto_update_mutex_);
+            stop_auto_update_ = true;
+        }
+        auto_update_cv_.notify_all();
+        auto_update_thread_.join();
+    }
+    stdexec::sync_wait(scope_.on_empty());
+}
 
 bool HttpServer::run() {
     try {
@@ -551,19 +694,28 @@ bool HttpServer::run() {
         LOG(INFO) << fmt::format("[HTTP Server] Listening on http://{}:{}/", address_, port_);
         LOG(INFO) << fmt::format("[HTTP Server] Serving static files from: {}", doc_root_);
 
+        HttpContext ctx{
+            parser_,
+            indexer_,
+            worker_scheduler_,
+            io_scheduler_,
+            doc_root_,
+            dev_path_
+        };
+
         for(;;) {
             tcp::socket socket{ioc};
             acceptor.accept(socket);
 
-            std::thread(
-                do_session,
-                std::move(socket),
-                doc_root_,
-                std::ref(parser_),
-                std::ref(indexer_),
-                std::ref(mutex_),
-                dev_path_
-            ).detach();
+            auto session_sender = stdexec::schedule(io_scheduler_)
+                | stdexec::then([s = std::move(socket), this, ctx]() mutable {
+                    do_session(
+                        std::move(s),
+                        ctx,
+                        scope_
+                    );
+                });
+            scope_.spawn(std::move(session_sender));
         }
     } catch (const std::exception& e) {
         LOG(ERROR) << "[HTTP Server] Error: " << e.what();
@@ -573,6 +725,6 @@ bool HttpServer::run() {
 }
 
 void HttpServer::stop() {
-    // Synchronous Beast acceptor loop is running, stopping it cleanly would require calling acceptor.close()
-    // or stopping ioc. For this command line backend tool, running until termination is fine.
+    stdexec::sync_wait(scope_.on_empty());
 }
+

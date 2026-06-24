@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(ntfsindex LANGUAGES CXX VERSION 1.0)
+project(ntfsindex LANGUAGES CXX VERSION 1.2)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +14,8 @@ find_package(Boost REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(absl REQUIRED)
 find_package(ftxui REQUIRED)
+find_package(P2300 REQUIRED)
+find_package(re2 REQUIRED)
 
 # Executable definition
 add_executable(ntfsindex
@@ -32,15 +34,19 @@ add_executable(ntfsindex
 # Link dependencies
 target_link_libraries(ntfsindex PRIVATE
     fmt::fmt
-    boost::boost
+    Boost::boost
     nlohmann_json::nlohmann_json
     absl::flags
     absl::flags_parse
     absl::log
     absl::log_initialize
+    absl::raw_hash_set
     ftxui::screen
     ftxui::dom
     ftxui::component
+    STDEXEC::stdexec
+    STDEXEC::asioexec
+    re2::re2
 )
 
 # Enable compiler warnings
@@ -67,6 +73,10 @@ target_link_libraries(ntfs_tests PRIVATE
     Catch2::Catch2WithMain
     absl::log
     absl::log_initialize
+    absl::raw_hash_set
+    STDEXEC::stdexec
+    STDEXEC::asioexec
+    nlohmann_json::nlohmann_json
 )
 if(MSVC)
     target_compile_options(ntfs_tests PRIVATE /W4)

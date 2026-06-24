@@ -43,6 +43,10 @@ jobs:
 
       - name: Install dependencies via Conan
         run: |
+          git clone https://github.com/hollykbuck/stdexec.git
+          cd stdexec
+          conan export .
+          cd ..
           conan install . --build=missing -s build_type=Release -s compiler.cppstd=20
 
       - name: Configure CMake
