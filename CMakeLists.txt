@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(ntfsindex LANGUAGES CXX VERSION 1.0)
+project(ntfsindex LANGUAGES CXX VERSION 1.2)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
